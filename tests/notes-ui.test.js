@@ -19,6 +19,10 @@ const notes = new Map([
   ["long", { id:"long", notebook_id:"default-notebook", notebook_name:"我的笔记", title:"长笔记", tags:[], source_filename:"", version:1, created_at:stamp, updated_at:stamp, content_md:longContent }],
   ["second", { id:"second", notebook_id:"default-notebook", notebook_name:"我的笔记", title:"第二篇", tags:[], source_filename:"", version:1, created_at:stamp, updated_at:stamp, content_md:"第二篇内容" }],
 ]);
+for (let index = 0; index < 28; index += 1) {
+  const id = `extra-${index}`;
+  notes.set(id, { id, notebook_id:"default-notebook", notebook_name:"我的笔记", title:`测试笔记 ${index + 1}`, tags:[], source_filename:"", version:1, created_at:stamp, updated_at:stamp, content_md:`测试内容 ${index + 1}` });
+}
 const patchPayloads = [];
 let createRequests = 0;
 
@@ -113,12 +117,38 @@ const server = http.createServer(async (request, response) => {
         navBottom:Math.round(nav.getBoundingClientRect().bottom),
         editorClient:editor.clientHeight, editorScroll:editor.scrollHeight,
         breaks:document.querySelectorAll("#note-preview br").length,
+        view:document.querySelector(".note-workspace").dataset.noteView,
+        previewVisible:getComputedStyle(document.querySelector(".note-preview-pane")).display !== "none",
+        listClient:document.querySelector("#note-list").clientHeight,
+        listScroll:document.querySelector("#note-list").scrollHeight,
       };
     });
     assert.ok(layout.documentHeight <= layout.viewport + 1, JSON.stringify(layout));
     assert.ok(layout.shellBottom <= layout.viewport && layout.navBottom <= layout.viewport, JSON.stringify(layout));
     assert.ok(layout.editorScroll > layout.editorClient, JSON.stringify(layout));
     assert.ok(layout.breaks > 100, JSON.stringify(layout));
+    assert.equal(layout.view, "edit");
+    assert.equal(layout.previewVisible, false);
+    assert.ok(layout.listScroll > layout.listClient, JSON.stringify(layout));
+
+    await page.locator("#note-content").fill("词汇");
+    await page.locator("#note-content").selectText();
+    await page.locator('[data-note-format="bold"]').click();
+    assert.equal(await page.locator("#note-content").inputValue(), "**词汇**");
+
+    await page.locator('[data-note-view="preview"]').click();
+    assert.equal(await page.locator(".note-workspace").getAttribute("data-note-view"), "preview");
+    assert.equal(await page.locator("#note-preview").getAttribute("contenteditable"), "true");
+    await page.locator("#note-preview").evaluate(element => {
+      element.innerHTML = "<h2>可视化标题</h2><p>直接编辑 <strong>正文</strong> 和 <a href=\"https://example.com\">链接</a></p><ul><li>要点</li></ul><blockquote><p>引用内容</p></blockquote><div class=\"markdown-table-wrap\"><table><thead><tr><th>列</th><th>值</th></tr></thead><tbody><tr><td>A</td><td>B</td></tr></tbody></table></div>";
+      element.dispatchEvent(new InputEvent("input", {bubbles:true,inputType:"insertText",data:"正文"}));
+    });
+    await page.waitForFunction(() => document.querySelector("#note-save-status")?.textContent === "已保存", null, {timeout:4000});
+    assert.equal(patchPayloads.at(-1).content_md, "## 可视化标题\n\n直接编辑 **正文** 和 [链接](https://example.com)\n\n- 要点\n\n> 引用内容\n\n| 列 | 值 |\n| --- | --- |\n| A | B |");
+
+    await page.locator('[data-note-view="split"]').click();
+    await page.locator("#note-splitter").press("ArrowRight");
+    assert.deepEqual(await page.evaluate(() => ({mode:localStorage.getItem("ielts_note_view_mode"),width:localStorage.getItem("ielts_note_editor_width")})), {mode:"split",width:"55"});
 
     await page.locator("#note-content").fill("保存中的第一版");
     await page.waitForTimeout(780);
@@ -134,6 +164,8 @@ const server = http.createServer(async (request, response) => {
     await page.waitForFunction(() => document.querySelector("#note-title")?.value === "第二篇", null, {timeout:2500});
     assert.ok(Date.now() - switchStarted < 500);
 
+    assert.equal(await page.locator("#note-ai-menu").getAttribute("class"), "note-menu");
+    await page.locator("#note-ai-toggle").click();
     await page.locator('[data-note-ai="organize"]').click();
     await page.waitForFunction(() => document.querySelector("#toast")?.textContent.includes("没有生成可用的笔记正文"));
     assert.equal(await page.locator(".note-diff").count(), 0);

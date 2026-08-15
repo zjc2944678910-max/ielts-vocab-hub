@@ -57,6 +57,9 @@ def main() -> None:
         "IELTS_VOCAB_ALLOWED_AUTHENTIK_USERS": os.environ.get("IELTS_VOCAB_ALLOWED_AUTHENTIK_USERS", ""),
         "IELTS_VOCAB_CONFIG_DIR": str(CONFIG_DIR),
         "IELTS_VOCAB_DATA_DIR": str(DATA_DIR),
+        # Never allow a private Oxford catalog to cross into the public runner,
+        # even when the parent shell has a local override configured.
+        "IELTS_VOCAB_CATALOG_PATH": str(ROOT / "data" / "catalog.db"),
     })
     logs = Path("/tmp")
     backend_log = (logs / "ielts-vocab-public-backend.log").open("ab", buffering=0)

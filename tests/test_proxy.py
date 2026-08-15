@@ -14,6 +14,68 @@ from proxy import ApiFailure, ai_translate_lookup, classify_for_storage, classif
 
 
 class CambridgeParserTests(unittest.TestCase):
+    def make_chat_handler(self, events):
+        handler = object.__new__(proxy.VocabApiHandler)
+        handler.allowed_origin = lambda: "http://127.0.0.1:8080"
+        handler.send_response = lambda _status: None
+        handler.end_cors_headers = lambda _content_type: None
+        handler.send_header = lambda _name, _value: None
+        handler.end_headers = lambda: None
+        handler.sse_event = lambda event, data: events.append((event, data))
+        return handler
+
+    def test_chat_stream_is_immediate_and_disables_deepseek_thinking(self):
+        response = [
+            b'data: {"choices":[{"delta":{"content":"A short answer."},"finish_reason":null}]}\n',
+            b'data: {"choices":[{"delta":{"content":"<actions>[{\\"type\\":\\"save_word\\",\\"word\\":\\"answer\\"}]</actions>"},"finish_reason":"stop"}]}\n',
+            b'data: [DONE]\n',
+        ]
+        config = {"base_url": "https://api.deepseek.com/v1/chat/completions", "model": "deepseek-v4-flash", "api_key": "test"}
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            with patch.multiple(proxy, CONFIG_DIR=base / "config", DATA_DIR=base / "data", DB_PATH=base / "data" / "data.db"), \
+                 patch("proxy.read_config", return_value=config), \
+                 patch("proxy.ai_request", return_value=response) as request:
+                with proxy.db_connect() as conn:
+                    now = proxy.now_iso()
+                    conn.execute("INSERT INTO chats VALUES(?,?,?,?,?)", ("chat", "新对话", None, now, now))
+                self.make_chat_handler(events).stream_chat("chat", {"content": "help"})
+                request.assert_called_once()
+                self.assertEqual(request.call_args.kwargs["thinking"], "disabled")
+                with proxy.db_connect() as conn:
+                    stored = conn.execute("SELECT content,status,actions_json FROM messages WHERE chat_id='chat' AND role='assistant'").fetchone()
+        deltas = [data["text"] for event, data in events if event == "delta"]
+        self.assertTrue(deltas)
+        self.assertLess(len(deltas[0]), 256)
+        self.assertNotIn("<actions>", "".join(deltas))
+        self.assertEqual((stored["content"], stored["status"]), ("A short answer.", "complete"))
+        self.assertIn("save_word", stored["actions_json"])
+
+    def test_chat_stream_persists_retryable_error_instead_of_empty_success(self):
+        response = [
+            b'data: {"choices":[{"delta":{"reasoning_content":"thinking"},"finish_reason":null}]}\n',
+            b'data: {"choices":[{"delta":{"content":""},"finish_reason":"length"}]}\n',
+            b'data: [DONE]\n',
+        ]
+        config = {"base_url": "https://api.deepseek.com/v1/chat/completions", "model": "deepseek-v4-flash", "api_key": "test"}
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            with patch.multiple(proxy, CONFIG_DIR=base / "config", DATA_DIR=base / "data", DB_PATH=base / "data" / "data.db"), \
+                 patch("proxy.read_config", return_value=config), \
+                 patch("proxy.ai_request", return_value=response):
+                with proxy.db_connect() as conn:
+                    now = proxy.now_iso()
+                    conn.execute("INSERT INTO chats VALUES(?,?,?,?,?)", ("chat", "新对话", None, now, now))
+                self.make_chat_handler(events).stream_chat("chat", {"content": "help"})
+                with proxy.db_connect() as conn:
+                    stored = conn.execute("SELECT content,status FROM messages WHERE chat_id='chat' AND role='assistant'").fetchone()
+        self.assertEqual(stored["status"], "error")
+        self.assertTrue(stored["content"])
+        self.assertIn("输出额度", stored["content"])
+        self.assertEqual([event for event, _data in events][-1], "error")
+
     def test_note_draft_budget_scales_for_deepseek_v4_only(self):
         deepseek = {
             "base_url": "https://api.deepseek.com/v1/chat/completions",
@@ -288,8 +350,9 @@ class CambridgeParserTests(unittest.TestCase):
 
     @patch("proxy.fetch_free_dictionary", side_effect=ApiFailure("word_not_found", "none", 404))
     @patch("proxy.fetch_local_dictionary", side_effect=ApiFailure("word_not_found", "none", 404))
+    @patch("proxy.fetch_oxford_dictionary", side_effect=ApiFailure("word_not_found", "none", 404))
     @patch("proxy.fetch_cambridge")
-    def test_smart_lookup_marks_redirect_as_alternative(self, cambridge, _local, free):
+    def test_smart_lookup_marks_redirect_as_alternative(self, cambridge, _oxford, _local, free):
         cambridge.return_value = {"word": "pot plant", "headword": "pot plant", "query": "plant pot", "exact": False, "definition": "室内盆栽植物", "senses": []}
         result = dictionary_lookup("plant pot", "smart")
         self.assertTrue(result["alternative"])
@@ -298,8 +361,9 @@ class CambridgeParserTests(unittest.TestCase):
 
     @patch("proxy.fetch_free_dictionary")
     @patch("proxy.fetch_local_dictionary", side_effect=ApiFailure("word_not_found", "none", 404))
+    @patch("proxy.fetch_oxford_dictionary", side_effect=ApiFailure("word_not_found", "none", 404))
     @patch("proxy.fetch_cambridge")
-    def test_smart_lookup_accepts_cambridge_inflection_without_free_fallback(self, cambridge, _local, free):
+    def test_smart_lookup_accepts_cambridge_inflection_without_free_fallback(self, cambridge, _oxford, _local, free):
         cambridge.return_value = {
             "word": "comparison", "headword": "comparison", "query": "comparisons",
             "exact": False, "match_kind": "inflection",
@@ -312,13 +376,33 @@ class CambridgeParserTests(unittest.TestCase):
         self.assertEqual(result["result"]["word"], "comparison")
         self.assertEqual(result["result"]["match_kind"], "inflection")
         self.assertEqual(result["result"]["definition"], "比较，对照，对比")
-        self.assertEqual([status["id"] for status in result["sources"]], ["cambridge", "ecdict"])
+        self.assertEqual([status["id"] for status in result["sources"]], ["oxford", "ecdict", "cambridge"])
         free.assert_not_called()
 
+    @patch("proxy.fetch_cambridge")
+    @patch("proxy.fetch_local_dictionary")
+    @patch("proxy.fetch_oxford_dictionary")
+    def test_smart_lookup_stops_before_cambridge_when_oxford_has_chinese(self, oxford, ecdict, cambridge):
+        oxford.return_value = {
+            "word": "comparison", "headword": "comparison", "query": "comparisons",
+            "exact": False, "match_kind": "inflection",
+            "inflection": {"form": "comparisons", "headword": "comparison", "label": "复数"},
+            "definition": "比较；对照；对比",
+            "senses": [{"pos": "noun", "definition": "比较", "source": "oxford"}],
+        }
+        ecdict.side_effect = ApiFailure("word_not_found", "none", 404)
+        result = dictionary_lookup("comparisons", "smart")
+        self.assertEqual(result["result"]["word"], "comparison")
+        self.assertEqual(result["result"]["match_kind"], "inflection")
+        self.assertEqual(result["sources"][0]["id"], "oxford")
+        cambridge.assert_not_called()
+
+    @patch("proxy.fetch_noad_dictionary")
     @patch("proxy.fetch_free_dictionary")
     @patch("proxy.fetch_local_dictionary", side_effect=ApiFailure("word_not_found", "none", 404))
+    @patch("proxy.fetch_oxford_dictionary", side_effect=ApiFailure("word_not_found", "none", 404))
     @patch("proxy.fetch_cambridge")
-    def test_smart_lookup_does_not_return_english_only_or_request_free(self, cambridge, _local, free):
+    def test_smart_lookup_does_not_return_english_only_or_request_free(self, cambridge, _oxford, _local, free, noad):
         cambridge.return_value = {
             "word": "example", "headword": "example", "query": "example", "exact": True,
             "definition": "a representative form or pattern",
@@ -329,6 +413,7 @@ class CambridgeParserTests(unittest.TestCase):
         self.assertEqual(failure.exception.status, 404)
         self.assertIn("中文义项", failure.exception.message)
         free.assert_not_called()
+        noad.assert_not_called()
 
     def test_dictionary_suggestions_use_local_prefix_index(self):
         suggestions = proxy.dictionary_suggestions("al", 8)

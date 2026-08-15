@@ -7,6 +7,7 @@ the configured model or the network is unavailable.
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 import shutil
@@ -21,7 +22,12 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent
-CATALOG_PATH = ROOT / "data" / "catalog.db"
+BUNDLED_CATALOG_PATH = ROOT / "data" / "catalog.db"
+CATALOG_PATH = (
+    BUNDLED_CATALOG_PATH
+    if os.environ.get("IELTS_VOCAB_PUBLIC_MODE", "0") == "1"
+    else Path(os.environ.get("IELTS_VOCAB_CATALOG_PATH", BUNDLED_CATALOG_PATH)).expanduser()
+)
 sys.path.insert(0, str(ROOT / "vendor"))
 from fsrs import Card, Rating, ReviewLog, Scheduler  # noqa: E402
 
@@ -76,6 +82,21 @@ ACADEMIC_SUFFIXES = (
     "ism", "ist", "ity", "ive", "ize", "ise", "ment", "ology", "ous",
     "phobia", "ship", "sion", "tion",
 )
+
+CATALOG_DEFINITIONS: dict[str, tuple[str, str]] = {
+    "ielts": ("IELTS 精选", "185 个高频雅思学术词"),
+    "cet4": ("CET-4 核心", "仅采用 ECDICT cet4 标签，基础词默认不进入训练"),
+    "cet6": ("CET-6 核心", "ECDICT 考试词，基础词默认不进入训练"),
+    "oxford_ielts": ("Oxford IELTS", "本机 Oxford IELTS 词表，默认关闭"),
+    "oxford_toefl": ("Oxford TOEFL", "本机 Oxford TOEFL 词表，默认关闭"),
+    "oxford_gre": ("Oxford GRE", "本机 Oxford GRE 词表，默认关闭"),
+    "oxford_cet4": ("Oxford CET-4", "本机 Oxford CET-4 词表，默认关闭"),
+    "oxford_cet6": ("Oxford CET-6", "本机 Oxford CET-6 词表，默认关闭"),
+    "oxford_kaoyan": ("Oxford 考研", "本机 Oxford 考研词表，默认关闭"),
+    "oxford_tem8": ("Oxford 专八", "本机 Oxford TEM-8 词表，默认关闭"),
+    "oxford_sat": ("Oxford SAT", "本机 Oxford SAT 词表，默认关闭"),
+}
+CATALOG_IDS = frozenset(CATALOG_DEFINITIONS)
 
 
 def utc_now() -> datetime:
@@ -273,9 +294,9 @@ def update_settings(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[s
         color = str(payload["button_color"]).strip().lower()
         clean["button_color"] = color if re.fullmatch(r"#[0-9a-f]{6}", color) else previous["button_color"]
     if "enabled_catalogs" in payload:
-        clean["enabled_catalogs"] = [x for x in payload["enabled_catalogs"] if x in {"ielts", "cet4", "cet6"}]
+        clean["enabled_catalogs"] = [x for x in payload["enabled_catalogs"] if x in CATALOG_IDS]
     if "paused_catalogs" in payload:
-        clean["paused_catalogs"] = [x for x in payload["paused_catalogs"] if x in {"ielts", "cet4", "cet6"}]
+        clean["paused_catalogs"] = [x for x in payload["paused_catalogs"] if x in CATALOG_IDS]
     if "daily_new_limit" in payload:
         clean["daily_new_limit"] = max(0, min(100, int(payload["daily_new_limit"])))
     if "dictation_count" in payload:
@@ -355,7 +376,7 @@ def catalog_study_tier(normalized: str, pos: str, bnc: int, source_tags_json: st
     rank = int(bnc or 0)
     if letters <= 3 or any(part.startswith(prefix) for prefix in FOUNDATION_POS_PREFIXES):
         return 9
-    has_exam_tag = bool(tags & {"cet4", "cet6"})
+    has_exam_tag = bool(tags & {"cet4", "cet6", "exam"})
     if has_exam_tag:
         if 0 < rank <= 600 and letters <= 6 and not word.endswith(ACADEMIC_SUFFIXES):
             return 9
@@ -437,34 +458,46 @@ def get_word(conn: sqlite3.Connection, normalized: str) -> dict[str, Any] | None
     return merge_word(base, personal)
 
 
+def _catalog_membership_clause(catalogs: list[str]) -> tuple[str, list[Any]]:
+    selected = list(dict.fromkeys(item for item in catalogs if item in CATALOG_IDS))
+    if not selected:
+        return "0=1", []
+    placeholders = ",".join("?" for _ in selected)
+    return (
+        f"EXISTS (SELECT 1 FROM json_each(catalog_entries.catalogs_json) membership WHERE membership.value IN ({placeholders}))",
+        selected,
+    )
+
+
 def catalog_counts(filter_basic_words: bool = True) -> list[dict[str, Any]]:
     with catalog_connection() as conn:
-        row = conn.execute(
-            """SELECT COUNT(*) total, SUM(is_ielts) ielts, SUM(is_cet4) cet4, SUM(is_cet6) cet6,
-               SUM(is_ielts AND study_tier(normalized,pos,bnc,source_tags_json,is_ielts)<9) study_ielts,
-               SUM(is_cet4 AND study_tier(normalized,pos,bnc,source_tags_json,is_ielts)<9) study_cet4,
-               SUM(is_cet6 AND study_tier(normalized,pos,bnc,source_tags_json,is_ielts)<9) study_cet6
-               FROM catalog_entries"""
-        ).fetchone()
-    def item(key: str, name: str, description: str) -> dict[str, Any]:
-        total = int(row[key])
-        ready = int(row[f"study_{key}"])
+        rows = {
+            row["catalog_id"]: row
+            for row in conn.execute(
+                """SELECT membership.value catalog_id, COUNT(*) total,
+                          SUM(study_tier(normalized,pos,bnc,source_tags_json,is_ielts)<9) ready
+                   FROM catalog_entries, json_each(catalog_entries.catalogs_json) membership
+                   GROUP BY membership.value"""
+            )
+            if row["catalog_id"] in CATALOG_IDS
+        }
+    def item(key: str) -> dict[str, Any]:
+        row = rows[key]
+        total = int(row["total"] or 0)
+        ready = int(row["ready"] or 0)
+        name, description = CATALOG_DEFINITIONS[key]
         return {
             "id": key, "name": name, "count": ready if filter_basic_words else total,
             "total_count": total, "hidden_count": total - ready if filter_basic_words else 0,
             "description": description,
         }
-    return [
-        item("ielts", "IELTS 精选", "185 个高频雅思学术词"),
-        item("cet4", "CET-4 核心", "仅采用 ECDICT cet4 标签，基础词默认不进入训练"),
-        item("cet6", "CET-6 核心", "ECDICT 考试词，基础词默认不进入训练"),
-    ]
+    return [item(key) for key in CATALOG_DEFINITIONS if key in rows]
 
 
 def library_page(conn: sqlite3.Connection, query: dict[str, list[str]]) -> dict[str, Any]:
-    catalogs = [x for x in (query.get("catalog") or query.get("catalogs") or []) if x in {"ielts", "cet4", "cet6"}]
+    catalogs = [x for x in (query.get("catalog") or query.get("catalogs") or []) if x in CATALOG_IDS]
     if len(catalogs) == 1 and "," in catalogs[0]:
-        catalogs = [x for x in catalogs[0].split(",") if x in {"ielts", "cet4", "cet6"}]
+        catalogs = [x for x in catalogs[0].split(",") if x in CATALOG_IDS]
     search = (query.get("search") or [""])[0].strip().lower()
     topic = (query.get("topic") or [""])[0]
     band = (query.get("band") or [""])[0]
@@ -476,8 +509,9 @@ def library_page(conn: sqlite3.Connection, query: dict[str, list[str]]) -> dict[
     if settings.get("filter_basic_words", True):
         where.append("study_tier(normalized,pos,bnc,source_tags_json,is_ielts)<9")
     if catalogs:
-        flags = {"ielts": "is_ielts", "cet4": "is_cet4", "cet6": "is_cet6"}
-        where.append("(" + " OR ".join(f"{flags[x]}=1" for x in catalogs) + ")")
+        catalog_clause, catalog_params = _catalog_membership_clause(catalogs)
+        where.append(catalog_clause)
+        params.extend(catalog_params)
     if search:
         where.append("(normalized LIKE ? OR definition LIKE ?)")
         params.extend([f"%{search}%", f"%{search}%"])
@@ -561,10 +595,9 @@ def ensure_card(conn: sqlite3.Connection, word: dict[str, Any], card_type: str, 
 
 def option_definitions(word: dict[str, Any], catalogs: list[str], filter_basic_words: bool = True) -> list[str]:
     target = word.get("definition", "")
-    flags = []
-    for name in catalogs:
-        flags.append({"ielts": "is_ielts=1", "cet4": "is_cet4=1", "cet6": "is_cet6=1"}[name])
-    where = "(" + " OR ".join(flags) + ")" if flags else "1=1"
+    where, catalog_params = _catalog_membership_clause(catalogs)
+    if where == "0=1":
+        where, catalog_params = "1=1", []
     if filter_basic_words:
         where += " AND study_tier(normalized,pos,bnc,source_tags_json,is_ielts)<9"
     pos = (word.get("pos") or "").split(".")[0]
@@ -572,7 +605,7 @@ def option_definitions(word: dict[str, Any], catalogs: list[str], filter_basic_w
         target_band = float(re.search(r"\d+(?:\.\d+)?", str(word.get("band", "6.5"))).group()) if re.search(r"\d+(?:\.\d+)?", str(word.get("band", "6.5"))) else 6.5
         candidates = catalog.execute(
             f"SELECT definition FROM catalog_entries WHERE {where} AND normalized!=? AND definition!='' AND pos LIKE ? AND ABS(CAST(substr(band,1,3) AS REAL)-?)<=1 ORDER BY RANDOM() LIMIT 18",
-            (normalize(word["word"]), f"{pos}%" if pos else "%", target_band),
+            (*catalog_params, normalize(word["word"]), f"{pos}%" if pos else "%", target_band),
         ).fetchall()
     values = [target]
     for row in candidates:
@@ -602,9 +635,7 @@ def task_payload(conn: sqlite3.Connection, card_row: sqlite3.Row, *, is_new: boo
 
 
 def _active_catalog_clause(catalogs: list[str]) -> tuple[str, list[Any]]:
-    flags = {"ielts": "is_ielts", "cet4": "is_cet4", "cet6": "is_cet6"}
-    selected = [flags[x] for x in catalogs if x in flags]
-    return ("(" + " OR ".join(f"{x}=1" for x in selected) + ")" if selected else "0=1", [])
+    return _catalog_membership_clause(catalogs)
 
 
 def create_session(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
@@ -615,7 +646,7 @@ def create_session(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[st
     if active:
         return get_session(conn, active["id"])
     settings = get_settings(conn)
-    requested_catalogs = [x for x in payload.get("catalogs", settings["enabled_catalogs"]) if x in {"ielts", "cet4", "cet6"}]
+    requested_catalogs = [x for x in payload.get("catalogs", settings["enabled_catalogs"]) if x in CATALOG_IDS]
     requested_topic = str(payload.get("topic") or "")
     default_scopes = ["due", "mistakes", "catalogs"] if mode == "dictation" else ["due", "catalogs"]
     raw_scopes = payload.get("scopes")

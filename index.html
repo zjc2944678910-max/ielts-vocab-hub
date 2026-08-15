@@ -150,26 +150,51 @@
               <div class="note-list" id="note-list"></div>
               <footer class="notes-import-row"><label class="text-button file-button">导入 Markdown<input id="notes-import" type="file" accept=".md,text/markdown,text/plain" multiple></label><button class="text-button" id="export-notes" type="button">导出 ZIP</button><small id="notes-usage">0 篇 · 0 MB</small></footer>
             </aside>
-            <section class="note-workspace">
+            <section class="note-workspace" data-note-view="edit">
               <header class="note-toolbar">
                 <div class="mobile-note-tabs" role="tablist"><button class="active" data-note-mobile-tab="list">列表</button><button data-note-mobile-tab="edit">编辑</button><button data-note-mobile-tab="preview">预览</button></div>
-                <div class="note-title-fields"><input id="note-title" maxlength="160" placeholder="无标题笔记" disabled><input id="note-tags" maxlength="400" placeholder="标签，用逗号分隔" disabled></div>
-                <div class="note-toolbar-actions"><span id="note-save-status">选择或新建一篇笔记</span><button class="text-button" id="export-note" disabled>导出 MD</button><button class="text-button danger-text" id="delete-note" disabled>删除</button></div>
+                <div class="note-title-fields">
+                  <div class="note-title-row"><input id="note-title" maxlength="160" placeholder="无标题笔记" disabled><span id="note-save-status">选择或新建一篇笔记</span></div>
+                  <input id="note-tags" maxlength="400" placeholder="添加标签，用逗号分隔" disabled>
+                </div>
+                <div class="note-toolbar-actions">
+                  <div class="note-view-switch" role="tablist" aria-label="笔记视图">
+                    <button class="active" type="button" role="tab" aria-selected="true" data-note-view="edit" disabled>编辑</button>
+                    <button type="button" role="tab" aria-selected="false" data-note-view="preview" disabled>预览</button>
+                    <button type="button" role="tab" aria-selected="false" data-note-view="split" disabled>分屏</button>
+                  </div>
+                  <div class="note-menu" id="note-ai-menu">
+                    <button class="secondary note-menu-toggle" id="note-ai-toggle" type="button" aria-haspopup="menu" aria-expanded="false" disabled>AI 助教</button>
+                    <div class="note-menu-panel" role="menu" aria-label="AI 笔记助教">
+                      <button type="button" role="menuitem" data-note-ai="ask" disabled>向 AI 提问</button>
+                      <button type="button" role="menuitem" data-note-ai="summarize" disabled>总结</button>
+                      <button type="button" role="menuitem" data-note-ai="organize" disabled>整理结构</button>
+                      <button type="button" role="menuitem" data-note-ai="polish" disabled>润色</button>
+                      <button type="button" role="menuitem" data-note-ai="outline" disabled>复习提纲</button>
+                    </div>
+                  </div>
+                  <div class="note-menu" id="note-more-menu">
+                    <button class="quiet-button note-menu-toggle" id="note-more-toggle" type="button" aria-haspopup="menu" aria-expanded="false" disabled>更多</button>
+                    <div class="note-menu-panel" role="menu" aria-label="更多笔记操作">
+                      <button type="button" role="menuitem" id="export-note" disabled>导出 Markdown</button>
+                      <button type="button" role="menuitem" class="danger-text" id="delete-note" disabled>删除笔记</button>
+                    </div>
+                  </div>
+                </div>
               </header>
+              <div class="note-format-toolbar" id="note-format-toolbar" aria-label="Markdown 格式工具">
+                <button type="button" data-note-format="heading" disabled>标题</button>
+                <button type="button" data-note-format="bold" disabled>粗体</button>
+                <button type="button" data-note-format="list" disabled>列表</button>
+                <button type="button" data-note-format="quote" disabled>引用</button>
+                <button type="button" data-note-format="link" disabled>链接</button>
+              </div>
               <div class="note-empty" id="note-empty"><span>✎</span><h2>把学习过程留在这里</h2><p>新建笔记，或导入已有 Markdown 文档。</p><button class="primary" id="empty-new-note">新建第一篇笔记</button></div>
               <div class="note-editor-shell hidden" id="note-editor-shell">
                 <section class="note-editor-pane"><div class="pane-label">MARKDOWN</div><textarea id="note-content" spellcheck="true" placeholder="# 标题&#10;&#10;开始记录…"></textarea></section>
-                <div class="note-splitter" id="note-splitter" role="separator" aria-label="调整编辑与预览宽度"></div>
-                <section class="note-preview-pane"><div class="pane-label">PREVIEW</div><article class="note-preview markdown" id="note-preview"></article></section>
+                <div class="note-splitter" id="note-splitter" role="separator" aria-label="调整编辑与预览宽度" aria-orientation="vertical" aria-valuemin="25" aria-valuemax="75" aria-valuenow="50" tabindex="0"></div>
+                <section class="note-preview-pane"><div class="pane-label">PREVIEW · 可直接编辑</div><article class="note-preview markdown" id="note-preview" contenteditable="true" role="textbox" aria-label="可视化笔记编辑器" aria-multiline="true" spellcheck="true"></article></section>
               </div>
-              <aside class="note-ai-bar" id="note-ai-bar">
-                <div><strong>AI 笔记助教</strong><small>只在你点击后发送当前笔记内容</small></div>
-                <button class="secondary" data-note-ai="ask" disabled>向 AI 提问</button>
-                <button class="secondary" data-note-ai="summarize" disabled>总结</button>
-                <button class="secondary" data-note-ai="organize" disabled>整理结构</button>
-                <button class="secondary" data-note-ai="polish" disabled>润色</button>
-                <button class="secondary" data-note-ai="outline" disabled>复习提纲</button>
-              </aside>
             </section>
           </div>
         </section>

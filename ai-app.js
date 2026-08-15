@@ -311,7 +311,12 @@
   function messageHtml(message, index) {
     const role = message.role === "assistant" ? "assistant" : "user";
     const actions = (message.actions || []).map((action, actionIndex) => `<div class="action-card" data-action-card><span>${esc(actionLabel(action))}</span><button data-confirm-action data-message-index="${index}" data-action-index="${actionIndex}">确认执行</button></div>`).join("");
-    const content = role === "assistant" && window.SafeMarkdown?.render ? window.SafeMarkdown.render(message.content || "") : esc(message.content || "");
+    const waiting = role === "assistant" && message.status === "generating" && !message.content;
+    const emptyReply = role === "assistant" && message.status !== "generating" && !message.content;
+    const content = waiting
+      ? `<span class="message-loading" role="status">正在生成…</span>`
+      : emptyReply ? `<span class="message-empty">此回复没有可显示内容，请重新生成。</span>`
+      : role === "assistant" && window.SafeMarkdown?.render ? window.SafeMarkdown.render(message.content || "") : esc(message.content || "");
     const citations = role === "assistant" && message.citations?.length ? `<div class="message-citations">${message.citations.map(source => `<button class="message-citation" data-open-note="${attr(source.note_id)}">[${esc(source.ref)}] ${esc(source.title)}${source.heading ? ` › ${esc(source.heading)}` : ""}</button>`).join("")}</div>` : "";
     return `<article class="message ${role}"><div class="message-avatar">${role === "assistant" ? "AI" : "你"}</div><div class="message-content"><div class="message-role">${role === "assistant" ? "IELTS 助教" : "YOU"}</div><div class="message-text${role === "assistant" ? " markdown" : ""}">${content}</div>${citations}${message.status && message.status !== "complete" && message.status !== "generating" ? `<div class="message-status">${message.status === "aborted" ? "生成已停止" : "生成未完成"}</div>` : ""}${actions ? `<div class="action-list">${actions}</div>` : ""}<div class="message-tools">${role === "assistant" && message.content ? `<button data-copy-message data-index="${index}">复制回复</button><button data-save-message-note data-index="${index}">保存为笔记</button>` : ""}</div></div></article>`;
   }
@@ -372,10 +377,14 @@
           if (eventName === "replace") { assistant.content = data.text || ""; scheduleMessagesRender(); }
           if (eventName === "sources") { assistant.citations = data.sources || []; scheduleMessagesRender(); }
           if (eventName === "actions") { assistant.actions = data.actions || []; scheduleMessagesRender(); }
-          if (eventName === "done") { assistant.status = data.status || "complete"; }
+          if (eventName === "done") {
+            assistant.status = data.status || "complete";
+            if (!assistant.content.trim()) throw new Error("模型没有返回可显示内容，请重试。");
+          }
           if (eventName === "error") throw new Error(data.message || "生成中断");
         }
       }
+      if (!assistant.content.trim()) throw new Error("模型没有返回可显示内容，请重试。");
       cacheActiveChat();
       await refreshChats(state.activeChat.id, { force: true });
     } catch (error) { assistant.status = "error"; assistant.content ||= error.message; renderMessages(); }

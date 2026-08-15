@@ -28,6 +28,22 @@ python3 -m http.server 8080 --bind 127.0.0.1
 ./start.sh
 ```
 
+## 本机 Oxford 私有词库
+
+已在本机完成 Oxford 导出时，可生成不含原始 XML 的结构化私有库：
+
+```bash
+python3 scripts/build_private_catalog.py
+```
+
+默认输出到 `~/.local/share/ielts-vocab-hub/catalog-private.db`。使用私有库启动：
+
+```bash
+./start-private.sh
+```
+
+普通 `./start.sh` 始终使用仓库内的开源词库，因此它也是即时回滚入口。私有数据库、清单和 Oxford 内容不会进入 GitHub；公开运行器也会强制使用开源词库。
+
 ## 测试
 
 ```bash
@@ -42,4 +58,4 @@ node tests/markdown.test.js
 
 仓库包含应用运行所需的只读 ECDICT 词库快照。来源版本与校验信息见 `data/catalog-manifest.json`，第三方许可见 `THIRD_PARTY_NOTICES.md` 和 `vendor/licenses/`。
 
-个人词库、对话、设置、API 配置、浏览器测试输出及运行数据库均被 `.gitignore` 排除。
+个人词库、对话、设置、API 配置、浏览器测试输出及运行数据库均被 `.gitignore` 排除。Oxford 私有导出只允许留在本机，不属于仓库发布内容。

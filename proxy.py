@@ -23,7 +23,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1095,8 +1094,84 @@ def fetch_free_dictionary(word: str) -> dict[str, Any]:
     }
 
 
+def fetch_structured_local_dictionary(word: str, source: str) -> dict[str, Any]:
+    query_word = normalize_word(word)
+    with study.catalog_connection() as catalog:
+        has_private_dictionary = catalog.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dictionary_entries'"
+        ).fetchone()
+        if not has_private_dictionary:
+            raise ApiFailure("word_not_found", f"本地 {source} 词库未启用", 404)
+        resolved = query_word
+        inflection_label = ""
+        row = catalog.execute(
+            "SELECT * FROM dictionary_entries WHERE normalized=? AND source=?",
+            (query_word, source),
+        ).fetchone()
+        if row is None:
+            alias_rows = catalog.execute(
+                """SELECT DISTINCT target.normalized,aliases.label
+                   FROM dictionary_aliases aliases
+                   JOIN dictionary_entries target ON target.normalized=aliases.normalized AND target.source=?
+                   WHERE aliases.alias=?""",
+                (source, query_word),
+            ).fetchall()
+            targets = {candidate["normalized"] for candidate in alias_rows}
+            if len(targets) != 1:
+                raise ApiFailure("word_not_found", f"本地 {source} 没有安全的精确词条", 404)
+            resolved = targets.pop()
+            labels = list(dict.fromkeys(candidate["label"] for candidate in alias_rows if candidate["normalized"] == resolved))
+            inflection_label = "/".join(labels)
+            row = catalog.execute(
+                "SELECT * FROM dictionary_entries WHERE normalized=? AND source=?",
+                (resolved, source),
+            ).fetchone()
+    if row is None:
+        raise ApiFailure("word_not_found", f"本地 {source} 没有精确词条", 404)
+    item = dict(row)
+    senses = safe_json_loads(item.pop("senses_json", "[]"), [])
+    examples = safe_json_loads(item.pop("examples_json", "[]"), [])
+    for index, sense in enumerate(senses):
+        sense["id"] = sense.get("id") or f"{source}-{index + 1}"
+        sense["headword"] = item["word"]
+        sense["source"] = source
+    exact = resolved == query_word
+    phonetic = item.get("phonetic_uk") or item.get("phonetic_us") or ""
+    if phonetic and not phonetic.startswith("/"):
+        phonetic = f"/{phonetic}/"
+    return {
+        **item,
+        "query": query_word,
+        "headword": item["word"],
+        "word": item["word"],
+        "exact": exact,
+        "match_kind": "exact" if exact else "inflection",
+        "inflection": {
+            "form": query_word, "headword": item["word"], "label": inflection_label,
+        } if not exact else None,
+        "phonetic": phonetic,
+        "source": source,
+        "senses": senses,
+        "examples": examples,
+        "band": estimate_band(item["word"]),
+    }
+
+
+def fetch_oxford_dictionary(word: str) -> dict[str, Any]:
+    return fetch_structured_local_dictionary(word, "oxford")
+
+
+def fetch_noad_dictionary(word: str) -> dict[str, Any]:
+    return fetch_structured_local_dictionary(word, "noad")
+
+
 def fetch_local_dictionary(word: str) -> dict[str, Any]:
     query_word = normalize_word(word)
+    try:
+        return fetch_structured_local_dictionary(word, "ecdict")
+    except ApiFailure as failure:
+        if failure.status != 404:
+            raise
     with study.catalog_connection() as catalog:
         item = study.catalog_row(catalog.execute("SELECT * FROM catalog_entries WHERE normalized=?", (query_word,)).fetchone())
     if not item or normalize_word(item.get("word", "")) != query_word:
@@ -1120,7 +1195,7 @@ def fetch_local_dictionary(word: str) -> dict[str, Any]:
 
 
 def dictionary_lookup(word: str, source: str = "smart") -> dict[str, Any]:
-    source = source if source in {"smart", "cambridge", "cambridge_zh_en", "ecdict", "free", "ai"} else "smart"
+    source = source if source in {"smart", "cambridge", "cambridge_zh_en", "oxford", "ecdict", "noad", "free", "ai"} else "smart"
     if source == "cambridge_zh_en":
         return {"result": fetch_cambridge_chinese(word), "mode": "cambridge_zh_en"}
     if source == "ai":
@@ -1136,7 +1211,13 @@ def dictionary_lookup(word: str, source: str = "smart") -> dict[str, Any]:
             return {"result": ai_translate_lookup(word), "mode": "ai", "fallback_from": "cambridge_zh_en"}
     if contains_chinese(word):
         raise ApiFailure("invalid_query", "该来源只支持英文；请切换 Cambridge 中英或 AI 翻译", 400)
-    fetchers = {"cambridge": fetch_cambridge, "ecdict": fetch_local_dictionary, "free": fetch_free_dictionary}
+    fetchers = {
+        "cambridge": fetch_cambridge,
+        "oxford": fetch_oxford_dictionary,
+        "ecdict": fetch_local_dictionary,
+        "noad": fetch_noad_dictionary,
+        "free": fetch_free_dictionary,
+    }
     if source != "smart":
         item = fetchers[source](word)
         if not item.get("senses") and not item.get("definition"):
@@ -1145,34 +1226,45 @@ def dictionary_lookup(word: str, source: str = "smart") -> dict[str, Any]:
 
     found: dict[str, dict[str, Any]] = {}
     statuses: list[dict[str, Any]] = []
-    smart_fetchers = {key: fetchers[key] for key in ("cambridge", "ecdict")}
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = {pool.submit(fetcher, word): key for key, fetcher in smart_fetchers.items()}
-        for future in as_completed(futures):
-            key = futures[future]
-            try:
-                item = future.result()
-                if not item.get("senses") and not item.get("definition"):
-                    raise ApiFailure("word_not_found", "词典没有返回可用义项", 404)
-                found[key] = item
-                statuses.append({
-                    "id": key,
-                    "status": "ok" if has_chinese_dictionary_meaning(item) else "no_chinese",
-                    "exact": item.get("exact", True),
-                    "match_kind": item.get("match_kind", "exact" if item.get("exact", True) else "redirect"),
-                    "headword": item.get("headword"),
-                    "sense_count": len(item.get("senses", [])),
-                })
-            except ApiFailure as exc:
-                statuses.append({"id": key, "status": "not_found" if exc.status == 404 else "unavailable", "message": exc.message})
+    for key in ("oxford", "ecdict"):
+        try:
+            item = fetchers[key](word)
+            if not item.get("senses") and not item.get("definition"):
+                raise ApiFailure("word_not_found", "词典没有返回可用义项", 404)
+            found[key] = item
+            statuses.append({
+                "id": key,
+                "status": "ok" if has_chinese_dictionary_meaning(item) else "no_chinese",
+                "exact": item.get("exact", True),
+                "match_kind": item.get("match_kind", "exact" if item.get("exact", True) else "redirect"),
+                "headword": item.get("headword"),
+                "sense_count": len(item.get("senses", [])),
+            })
+        except ApiFailure as exc:
+            statuses.append({"id": key, "status": "not_found" if exc.status == 404 else "unavailable", "message": exc.message})
     matched_results = [
-        found[key] for key in ("cambridge", "ecdict")
+        found[key] for key in ("oxford", "ecdict")
         if key in found and is_dictionary_match(found[key]) and has_chinese_dictionary_meaning(found[key])
     ]
     if not matched_results:
-        alternative = found.get("cambridge")
-        if alternative and not is_dictionary_match(alternative):
-            return {"result": alternative, "sources": statuses, "alternative": True}
+        try:
+            cambridge = fetch_cambridge(word)
+            found["cambridge"] = cambridge
+            statuses.append({
+                "id": "cambridge",
+                "status": "ok" if has_chinese_dictionary_meaning(cambridge) else "no_chinese",
+                "exact": cambridge.get("exact", True),
+                "match_kind": cambridge.get("match_kind", "exact" if cambridge.get("exact", True) else "redirect"),
+                "headword": cambridge.get("headword"),
+                "sense_count": len(cambridge.get("senses", [])),
+            })
+            if is_dictionary_match(cambridge) and has_chinese_dictionary_meaning(cambridge):
+                matched_results = [cambridge]
+            elif not is_dictionary_match(cambridge):
+                return {"result": cambridge, "sources": statuses, "alternative": True}
+        except ApiFailure as exc:
+            statuses.append({"id": "cambridge", "status": "not_found" if exc.status == 404 else "unavailable", "message": exc.message})
+    if not matched_results:
         if " " in normalize_word(word) and read_config():
             return {"result": ai_translate_lookup(word), "sources": statuses, "mode": "ai", "fallback_from": "dictionaries"}
         raise ApiFailure("word_not_found", "没有找到可用的中文义项", 404)
@@ -1188,7 +1280,8 @@ def dictionary_lookup(word: str, source: str = "smart") -> dict[str, Any]:
     primary["senses"] = merged_senses[:12]
     primary["examples"] = [example for sense in primary["senses"] for example in sense.get("examples", [])][:8]
     primary["source"] = "smart"
-    return {"result": primary, "sources": sorted(statuses, key=lambda item: ("cambridge", "ecdict").index(item["id"]))}
+    order = {"oxford": 0, "ecdict": 1, "cambridge": 2}
+    return {"result": primary, "sources": sorted(statuses, key=lambda item: order.get(item["id"], 9))}
 
 
 def dictionary_suggestions(query: str, limit: int = 8) -> list[dict[str, Any]]:
@@ -1200,7 +1293,7 @@ def dictionary_suggestions(query: str, limit: int = 8) -> list[dict[str, Any]]:
     with study.catalog_connection() as catalog:
         if contains_chinese(clean):
             rows = catalog.execute(
-                """SELECT word,pos,definition,is_ielts,is_cet4,is_cet6,bnc,frq
+                """SELECT word,pos,definition,catalogs_json,is_ielts,bnc,frq
                    FROM catalog_entries WHERE definition LIKE ?
                    ORDER BY is_ielts DESC, CASE WHEN bnc>0 THEN bnc ELSE 999999 END,
                             CASE WHEN frq>0 THEN frq ELSE 999999 END, normalized LIMIT ?""",
@@ -1209,7 +1302,7 @@ def dictionary_suggestions(query: str, limit: int = 8) -> list[dict[str, Any]]:
         else:
             upper = clean + "\uffff"
             rows = catalog.execute(
-                """SELECT word,pos,definition,is_ielts,is_cet4,is_cet6,bnc,frq
+                """SELECT word,pos,definition,catalogs_json,is_ielts,bnc,frq
                    FROM catalog_entries WHERE normalized>=? AND normalized<?
                    ORDER BY CASE WHEN normalized=? THEN 0 ELSE 1 END, is_ielts DESC,
                             CASE WHEN bnc>0 THEN bnc ELSE 999999 END,
@@ -1218,7 +1311,7 @@ def dictionary_suggestions(query: str, limit: int = 8) -> list[dict[str, Any]]:
             ).fetchall()
     return [{
         "word": row["word"], "pos": row["pos"], "definition": row["definition"],
-        "catalogs": [name for name, enabled in (("ielts", row["is_ielts"]), ("cet4", row["is_cet4"]), ("cet6", row["is_cet6"])) if enabled],
+        "catalogs": safe_json_loads(row["catalogs_json"], []),
     } for row in rows]
 
 
@@ -1962,7 +2055,18 @@ class VocabApiHandler(BaseHTTPRequestHandler):
             if old:
                 old.set()
             ACTIVE_STREAMS[chat_id] = cancel
-        response = ai_request(messages, config=config, stream=True, max_tokens=1600)
+        # DeepSeek V4 enables thinking by default and streams that text through
+        # reasoning_content before the user-visible answer.  This lightweight
+        # tutor chat only needs the final answer; disabling thinking avoids a
+        # long blank wait and prevents the reasoning budget from consuming the
+        # whole response before content is produced.
+        response = ai_request(
+            messages,
+            config=config,
+            stream=True,
+            max_tokens=1600,
+            thinking="disabled" if is_deepseek_v4_config(config) else None,
+        )
         origin = self.allowed_origin()
         if origin == "":
             raise ApiFailure("origin_forbidden", "不允许的请求来源", 403)
@@ -1974,6 +2078,7 @@ class VocabApiHandler(BaseHTTPRequestHandler):
         raw_text = ""
         pending = ""
         emitted = 0
+        finish_reason = None
         status = "complete"
         try:
             self.sse_event("start", {"message_id": assistant_id})
@@ -1992,18 +2097,36 @@ class VocabApiHandler(BaseHTTPRequestHandler):
                 packet = safe_json_loads(data, {})
                 delta = ""
                 try:
-                    delta = packet["choices"][0]["delta"].get("content") or ""
+                    choice = packet["choices"][0]
+                    delta = choice["delta"].get("content") or ""
                 except (KeyError, IndexError, TypeError):
                     continue
+                if choice.get("finish_reason"):
+                    finish_reason = str(choice["finish_reason"])
                 raw_text += delta
                 pending += delta
-                if len(pending) > 256:
-                    chunk = pending[:-256]
-                    pending = pending[-256:]
+                # Only retain enough text to detect an <actions> tag split
+                # across SSE packets.  The old fixed 256-character holdback
+                # made short answers appear frozen until generation ended.
+                action_start = pending.find("<actions>")
+                if action_start >= 0:
+                    chunk = pending[:action_start]
+                    pending = pending[action_start:]
+                else:
+                    holdback = len("<actions>") - 1
+                    chunk = pending[:-holdback] if len(pending) > holdback else ""
+                    pending = pending[-holdback:] if len(pending) > holdback else pending
+                if chunk:
                     emitted += len(chunk)
                     self.sse_event("delta", {"text": chunk})
             clean_text, actions = extract_actions(raw_text)
             clean_text = sanitize_note_citations(clean_text, sources)
+            if not clean_text and not actions:
+                status = "error"
+                if finish_reason == "length":
+                    clean_text = "模型输出额度已用完，未能生成最终回答，请重试。"
+                else:
+                    clean_text = "模型没有返回可显示内容，请重试。"
             remainder = clean_text[emitted:]
             if remainder:
                 self.sse_event("delta", {"text": remainder})
@@ -2014,7 +2137,14 @@ class VocabApiHandler(BaseHTTPRequestHandler):
                 conn.execute("UPDATE messages SET content = ?, status = ?, actions_json = ?, citations_json = ? WHERE id = ?",
                              (clean_text, status, json.dumps(actions, ensure_ascii=False), json.dumps(sources, ensure_ascii=False), assistant_id))
                 conn.execute("UPDATE chats SET updated_at = ? WHERE id = ?", (now_iso(), chat_id))
-            self.sse_event("done", {"message_id": assistant_id, "status": status})
+            if status == "error":
+                self.sse_event("error", {
+                    "type": "empty_response",
+                    "message": clean_text,
+                    "finish_reason": finish_reason,
+                })
+            else:
+                self.sse_event("done", {"message_id": assistant_id, "status": status})
         except (BrokenPipeError, ConnectionResetError):
             status = "aborted"
             clean_text, actions = extract_actions(raw_text)
