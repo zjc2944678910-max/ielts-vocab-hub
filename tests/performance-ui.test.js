@@ -1,0 +1,46 @@
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const root = path.resolve(__dirname, "..");
+const app = fs.readFileSync(path.join(root, "app.js"), "utf8");
+const study = fs.readFileSync(path.join(root, "study-app.js"), "utf8");
+const notes = fs.readFileSync(path.join(root, "notes-app.js"), "utf8");
+const ai = fs.readFileSync(path.join(root, "ai-app.js"), "utf8");
+const styles = fs.readFileSync(path.join(root, "styles.css"), "utf8");
+
+assert.doesNotMatch(study, /data-tab="settings"[^\n]+setTimeout\(renderSettings/);
+assert.doesNotMatch(study, /data-tab="flashcards"[^\n]+setTimeout\(renderReview/);
+assert.doesNotMatch(study, /data-tab="dictation"[^\n]+setTimeout\(renderDictation/);
+assert.match(study, /coreRefreshPromise/);
+assert.match(study, /Date\.now\(\) - state\.coreRefreshedAt < 30_000/);
+assert.match(notes, /Date\.now\(\) - state\.refreshedAt < 30_000/);
+assert.match(notes, /const notePromise = loadNote\(id\)/);
+assert.match(notes, /Promise\.all\(\[\s*api\(`\/api\/notes\/\$\{note\.id\}`/);
+assert.match(notes, /schedulePreview/);
+assert.match(ai, /chatSelectionToken/);
+assert.match(ai, /chatCache: new Map\(\)/);
+assert.match(ai, /chatHtmlCache: new Map\(\)/);
+assert.match(ai, /scheduleMessagesRender/);
+assert.doesNotMatch(ai, /DELETE" \}\); state\.activeChat = null; await refreshChats\(\)/);
+assert.match(study, /limit:"50"/);
+assert.match(study, /libraryRequestToken/);
+assert.match(app, /behavior: "auto"/);
+assert.match(styles, /body\.has-custom-background \.view\.active \{ animation: none; \}/);
+assert.match(app, /let suggestionController = null;/);
+assert.match(app, /suggestionController\?\.abort\(\);/);
+assert.match(app, /AbortSignal\.any\(\[suggestionController\.signal, AbortSignal\.timeout\(2500\)\]\)/);
+assert.match(app, /addEventListener\("compositionstart", \(\) => \{\s*searchComposing = true;/);
+assert.match(app, /addEventListener\("compositionend", event => \{\s*searchComposing = false;\s*scheduleSuggestions\(event\.target\.value, 0\);/);
+assert.match(app, /if \(!searchComposing\) scheduleSuggestions\(event\.target\.value\);/);
+assert.match(styles, /\.suggestions \{ display: none; max-height: min\(320px, 42vh\); margin-top: 8px;/);
+assert.doesNotMatch(styles, /\.suggestions \{[^}]*position:\s*absolute/);
+assert.match(app, /function isDictionaryMatch\(item\) \{ return Boolean\(item\?\.exact \|\| item\?\.match_kind === "inflection"\); \}/);
+assert.match(app, /data-dictionary-source-jump="free"/);
+assert.match(app, /英英释义，非翻译/);
+assert.match(app, /preserveSource: source === "free"/);
+assert.doesNotMatch(app, /requestDictionary\(query, "free", signal\)/);
+assert.match(styles, /\.inflection-note/);
+assert.match(styles, /\.dictionary-language-notice/);
+
+console.log("performance UI guard tests passed");

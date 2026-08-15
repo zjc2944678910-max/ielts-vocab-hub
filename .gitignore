@@ -1,0 +1,33 @@
+.DS_Store
+
+# Python/runtime artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# JavaScript/browser tooling
+node_modules/
+.playwright-cli/
+output/
+
+# Local code-intelligence index
+.gitnexus/
+
+# Personal configuration and runtime state
+.env
+.env.*
+!.env.example
+config/
+backups/
+visitors/
+*.log
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+
+# The bundled read-only ECDICT catalog is application data, not user state.
+!data/catalog.db
+

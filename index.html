@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src 'self' http://127.0.0.1:8081 http://localhost:8081 https://api.dictionaryapi.dev; img-src 'self' data: blob: http://127.0.0.1:8081 http://localhost:8081; media-src 'self' blob: http://127.0.0.1:8081 http://localhost:8081; object-src 'none'; base-uri 'none'; form-action 'self'">
+  <script src="startup-redirect.js?v=20260814-byok"></script>
+  <script src="runtime-config.js?v=20260814-notes"></script>
+  <meta name="description" content="面向雅思备考的本地词汇学习工作台：查词、分类词库、闪卡、同义替换和听写。">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22><rect width=%2264%22 height=%2264%22 rx=%2216%22 fill=%22%239fe7c5%22/><text x=%2232%22 y=%2240%22 text-anchor=%22middle%22 font-family=%22Arial%22 font-size=%2224%22 font-weight=%22700%22 fill=%22%23102119%22>VA</text></svg>">
+  <title>Vocab Atelier · IELTS 词汇工作台</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css?v=20260814-notes">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <button class="brand-mark" id="sidebar-toggle" type="button" aria-expanded="true" aria-label="收起侧边栏" title="收起侧边栏">VA</button>
+        <a class="brand-copy" href="#lookup" data-tab="lookup" aria-label="返回查词"><strong>Vocab Atelier</strong><small>IELTS STUDY DESK</small></a>
+      </div>
+
+      <nav class="main-nav" aria-label="主要功能">
+        <button class="nav-item active" data-tab="lookup" title="智能查词" aria-label="智能查词"><span>⌕</span><b>智能查词</b></button>
+        <button class="nav-item" data-tab="library" title="分类词库" aria-label="分类词库"><span>▤</span><b>分类词库</b></button>
+        <button class="nav-item" data-tab="flashcards" title="今日复习" aria-label="今日复习"><span>◇</span><b>今日复习</b></button>
+        <button class="nav-item" data-tab="paraphrase" title="同义替换" aria-label="同义替换"><span>⇄</span><b>同义替换</b></button>
+        <button class="nav-item" data-tab="dictation" title="听写训练" aria-label="听写训练"><span class="nav-audio-icon"><img src="assets/graphic-eq-round.svg" alt="" aria-hidden="true"></span><b>听写训练</b></button>
+        <button class="nav-item" data-tab="notebook" title="生词本" aria-label="生词本"><span>☆</span><b>生词本</b><em id="saved-count">0</em></button>
+        <button class="nav-item" data-tab="notes" title="学习笔记" aria-label="学习笔记"><span>✎</span><b>学习笔记</b></button>
+        <button class="nav-item" data-tab="assistant" title="AI 助教" aria-label="AI 助教"><span>✦</span><b>AI 助教</b></button>
+        <button class="nav-item" data-tab="settings" title="个人设置" aria-label="个人设置"><span>⚙</span><b>个人设置</b></button>
+      </nav>
+
+      <div class="sidebar-profile" aria-label="当前学习者">
+        <span class="profile-avatar profile-avatar-small"><img data-profile-avatar alt="个人头像" hidden><b data-profile-initials>学习</b></span>
+        <span><strong data-profile-name>学习者</strong><small>LOCAL LEARNER</small></span>
+      </div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <button class="mobile-brand" data-mobile-menu aria-label="打开导航"><span class="profile-avatar profile-avatar-mobile"><img data-profile-avatar alt="" hidden><b data-profile-initials>学习</b></span><span data-profile-name>学习者</span></button>
+        <div class="engine-status"><i id="engine-dot"></i><span id="engine-text">本地词库 · 多词典按需连接</span></div>
+        <div class="top-actions">
+          <button class="quiet-button api-status-button" id="open-api-settings" aria-label="打开 API 设置"><i id="api-status-dot"></i><span id="api-status-text">API 未配置</span></button>
+          <button class="quiet-button" id="reset-progress">重置今日进度</button>
+          <div class="top-daily" aria-label="今日学习进度">
+            <div class="daily-ring" id="daily-ring"><span id="daily-progress">0%</span></div>
+            <div><strong>今日学习</strong><small id="daily-copy">开始第一个单词</small></div>
+          </div>
+          <div class="streak"><span>连续</span><strong id="streak-days">1 天</strong></div>
+        </div>
+      </header>
+
+      <main>
+        <section class="view active" id="view-lookup">
+          <div class="lookup-intro reveal">
+            <p class="eyebrow">LOOKUP · MULTI-SOURCE DICTIONARY</p>
+            <h1>今天想弄懂哪个词？</h1>
+            <p>输入英文、短语或中文；智能判断会优先查词典，必要时再使用 AI 翻译。</p>
+            <div class="search-stack">
+              <form class="search-form" id="search-form">
+                <span>⌕</span>
+                <input id="search-input" autocomplete="off" spellcheck="false" placeholder="输入英文、短语或中文，例如 alleviate / 缓解压力">
+                <button type="submit">查询 <kbd>↵</kbd></button>
+              </form>
+              <div class="suggestions" id="suggestions" role="listbox" aria-label="搜索建议"></div>
+            </div>
+            <div class="dictionary-source-switch" id="dictionary-source-switch" aria-label="词典来源">
+              <span>词典来源</span>
+              <div role="group">
+                <button class="active" type="button" data-dictionary-source="smart">智能判断</button>
+                <button type="button" data-dictionary-source="cambridge">Cambridge 英中</button>
+                <button type="button" data-dictionary-source="cambridge_zh_en">Cambridge 中英</button>
+                <button type="button" data-dictionary-source="ecdict">ECDICT 本地</button>
+                <button type="button" data-dictionary-source="ai">AI 翻译</button>
+              </div>
+              <small id="dictionary-source-note">自动识别英文词、英文短语、中文词语和中文句子；词典优先，AI 按需回退。</small>
+            </div>
+          </div>
+
+          <div class="lookup-layout">
+            <div id="word-detail" class="word-detail reveal"></div>
+            <aside class="study-rail reveal">
+              <p class="rail-label">今日概览</p>
+              <div class="metric"><strong id="stat-lookups">0</strong><span>查词</span></div>
+              <div class="metric"><strong id="stat-mastered">0</strong><span>已掌握</span></div>
+              <div class="metric"><strong id="stat-review">0</strong><span>待复习</span></div>
+              <hr>
+              <p class="rail-label">试试这些</p>
+              <div id="recommended-words" class="recommended"></div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view" id="view-library">
+          <div class="section-heading">
+            <div><p class="eyebrow">CURATED LIBRARY</p><h1>分类词库</h1><p>按话题和目标分数筛选，把词汇变成可完成的学习队列。</p></div>
+            <strong id="library-count">0 词</strong>
+          </div>
+          <div class="filter-row">
+            <select id="topic-filter" aria-label="话题筛选"><option value="all">全部话题</option></select>
+            <select id="band-filter" aria-label="分数筛选">
+              <option value="0">全部分数</option><option value="6.5">Band 6.5+</option><option value="7">Band 7.0+</option><option value="7.5">Band 7.5+</option><option value="8">Band 8.0+</option>
+            </select>
+            <input id="library-search" placeholder="筛选词库…" aria-label="筛选词库">
+          </div>
+          <div id="library-list" class="word-list"></div>
+        </section>
+
+        <section class="view" id="view-flashcards">
+          <div class="section-heading compact"><div><p class="eyebrow">FSRS · DUE FIRST</p><h1>今日复习</h1><p>先完成到期卡，再学习今日新词；词义与拼写分别安排。</p></div><div id="review-summary" class="review-summary"></div></div>
+          <div id="review-home" class="study-home"></div>
+          <div id="review-session" class="study-session hidden" aria-live="polite"></div>
+        </section>
+
+        <section class="view" id="view-paraphrase">
+          <div class="section-heading compact"><div><p class="eyebrow">PARAPHRASE DRILL</p><h1>同义替换</h1><p>训练雅思阅读定位和写作改写所需的词义连接。</p></div><strong>连胜 <span id="quiz-streak">0</span></strong></div>
+          <div class="quiz-panel">
+            <small>选择最合适的学术表达</small><h2 id="quiz-question"></h2>
+            <div id="quiz-options" class="quiz-options"></div>
+            <div id="quiz-feedback" class="quiz-feedback" aria-live="polite"></div>
+            <button class="primary hidden" id="quiz-next">下一题 →</button>
+          </div>
+        </section>
+
+        <section class="view" id="view-dictation">
+          <div class="section-heading compact"><div><p class="eyebrow">LISTEN · SPELL · CORRECT</p><h1>听写训练</h1><p>到期拼写会更新复习计划；自由练习不会提前推迟下次正式复习。</p></div><strong id="dictation-score">0 / 0</strong></div>
+          <div id="dictation-home" class="study-home"></div>
+          <div id="dictation-session" class="study-session hidden" aria-live="polite"></div>
+        </section>
+
+        <section class="view" id="view-notebook">
+          <div class="section-heading"><div><p class="eyebrow">SAVED WORDS</p><h1>我的生词本</h1><p>收藏过的词都在这里，可直接进入查词或加入复习队列。</p></div><button class="quiet-button" id="clear-notebook">清空生词本</button></div>
+          <div id="notebook-list" class="word-list"></div>
+        </section>
+
+        <section class="view notes-view" id="view-notes">
+          <div class="notes-shell">
+            <aside class="notes-navigator" id="notes-navigator">
+              <header class="notes-nav-head">
+                <div><p class="eyebrow">PERSONAL KNOWLEDGE</p><h2>学习笔记</h2></div>
+                <div><button class="icon-button" id="toggle-notes-nav" type="button" title="收起笔记列表" aria-label="收起笔记列表">‹</button><button class="icon-button" id="new-note" type="button" title="新建笔记" aria-label="新建笔记">＋</button></div>
+              </header>
+              <div class="notes-search-row"><input id="notes-search" type="search" placeholder="搜索标题、标签和正文…"><button class="icon-button" id="new-notebook" type="button" title="新建笔记本" aria-label="新建笔记本">▥</button></div>
+              <div class="notebook-list" id="notes-notebook-list"></div>
+              <div class="note-list" id="note-list"></div>
+              <footer class="notes-import-row"><label class="text-button file-button">导入 Markdown<input id="notes-import" type="file" accept=".md,text/markdown,text/plain" multiple></label><button class="text-button" id="export-notes" type="button">导出 ZIP</button><small id="notes-usage">0 篇 · 0 MB</small></footer>
+            </aside>
+            <section class="note-workspace">
+              <header class="note-toolbar">
+                <div class="mobile-note-tabs" role="tablist"><button class="active" data-note-mobile-tab="list">列表</button><button data-note-mobile-tab="edit">编辑</button><button data-note-mobile-tab="preview">预览</button></div>
+                <div class="note-title-fields"><input id="note-title" maxlength="160" placeholder="无标题笔记" disabled><input id="note-tags" maxlength="400" placeholder="标签，用逗号分隔" disabled></div>
+                <div class="note-toolbar-actions"><span id="note-save-status">选择或新建一篇笔记</span><button class="text-button" id="export-note" disabled>导出 MD</button><button class="text-button danger-text" id="delete-note" disabled>删除</button></div>
+              </header>
+              <div class="note-empty" id="note-empty"><span>✎</span><h2>把学习过程留在这里</h2><p>新建笔记，或导入已有 Markdown 文档。</p><button class="primary" id="empty-new-note">新建第一篇笔记</button></div>
+              <div class="note-editor-shell hidden" id="note-editor-shell">
+                <section class="note-editor-pane"><div class="pane-label">MARKDOWN</div><textarea id="note-content" spellcheck="true" placeholder="# 标题&#10;&#10;开始记录…"></textarea></section>
+                <div class="note-splitter" id="note-splitter" role="separator" aria-label="调整编辑与预览宽度"></div>
+                <section class="note-preview-pane"><div class="pane-label">PREVIEW</div><article class="note-preview markdown" id="note-preview"></article></section>
+              </div>
+              <aside class="note-ai-bar" id="note-ai-bar">
+                <div><strong>AI 笔记助教</strong><small>只在你点击后发送当前笔记内容</small></div>
+                <button class="secondary" data-note-ai="ask" disabled>向 AI 提问</button>
+                <button class="secondary" data-note-ai="summarize" disabled>总结</button>
+                <button class="secondary" data-note-ai="organize" disabled>整理结构</button>
+                <button class="secondary" data-note-ai="polish" disabled>润色</button>
+                <button class="secondary" data-note-ai="outline" disabled>复习提纲</button>
+              </aside>
+            </section>
+          </div>
+        </section>
+
+        <section class="view assistant-view" id="view-assistant">
+          <div class="assistant-shell">
+            <aside class="chat-sidebar">
+              <div class="chat-sidebar-head">
+                <div class="chat-sidebar-title"><p class="eyebrow">LOCAL HISTORY</p><h2>学习对话</h2></div>
+                <div class="chat-sidebar-actions">
+                  <button class="chat-history-toggle" id="chat-history-toggle" type="button" aria-expanded="true" aria-label="收起对话历史" title="收起对话历史"><span aria-hidden="true">‹</span></button>
+                  <button class="icon-button" id="new-chat" type="button" aria-label="新建对话" title="新建对话">＋</button>
+                </div>
+              </div>
+              <div id="chat-list" class="chat-list"></div>
+            </aside>
+            <div class="chat-workspace">
+              <header class="chat-head">
+                <div><h1 id="chat-title">AI 学习助教</h1><p id="chat-context">词义辨析、写作改写、例句与学习建议</p></div>
+                <div class="mobile-chat-controls"><select id="mobile-chat-select" aria-label="选择对话"></select><button class="icon-button" id="mobile-new-chat" aria-label="新建对话">＋</button></div>
+                <div class="chat-head-actions"><button class="quiet-button" id="rename-chat">重命名</button><button class="quiet-button danger-text" id="delete-chat">删除</button></div>
+              </header>
+              <div id="chat-messages" class="chat-messages">
+                <div class="chat-empty"><span>✦</span><h2>从一个具体问题开始</h2><p>例如：帮我区分 alleviate 和 mitigate，并各写一个雅思作文例句。</p></div>
+              </div>
+              <div class="chat-composer-wrap">
+                <div id="chat-context-chip" class="context-chip hidden"></div>
+                <div class="chat-note-context" id="chat-note-context"><div id="chat-note-chips"></div><button class="text-button" id="choose-chat-notes" type="button">选择参考笔记</button><label class="check-line"><input id="search-all-notes-once" type="checkbox">本次临时检索全部笔记</label></div>
+                <form id="chat-form" class="chat-composer"><textarea id="chat-input" rows="1" maxlength="12000" autocomplete="off" placeholder="向 IELTS 学习助教提问…"></textarea><button type="button" class="stop-button hidden" id="stop-chat">停止</button><button type="submit" class="primary" id="send-chat">发送</button></form>
+                <div class="composer-foot"><span>AI 可能出错，请核对重要内容。</span><button class="text-button" id="regenerate-chat">重新生成上一条回复</button></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="view-settings">
+          <div class="section-heading"><div><p class="eyebrow">PERSONAL · LOCAL · PRIVATE</p><h1>个人设置</h1><p>学习计划、训练偏好、API 和数据都只保存在这台电脑。</p></div></div>
+          <div class="settings-layout">
+            <nav class="settings-nav" aria-label="设置分区"><button data-settings-anchor="settings-profile">个人资料</button><button data-settings-anchor="settings-plan">学习计划</button><button data-settings-anchor="settings-training">训练偏好</button><button data-settings-anchor="settings-api">API 管理</button><button data-settings-anchor="settings-data">数据管理</button></nav>
+            <div class="settings-content">
+              <section class="settings-section profile-settings" id="settings-profile">
+                <p class="eyebrow">PROFILE · APPEARANCE</p><h2>个人资料与主题</h2><p>自定义内容只保存在本机。选择照片并完成裁剪后会自动压缩保存，不会发送到第三方。</p>
+                <div class="profile-identity-editor">
+                  <span class="profile-avatar profile-avatar-editor"><img id="setting-avatar-preview" alt="头像预览" hidden><b id="setting-avatar-initials">学习</b></span>
+                  <div class="profile-identity-fields">
+                    <label>显示名字<input id="setting-profile-name" maxlength="40" autocomplete="name" placeholder="例如：Jin"></label>
+                    <div class="profile-file-actions"><label class="secondary file-button">选择头像<input id="setting-avatar-file" type="file" accept="image/jpeg,image/png,image/webp"></label><button class="text-button" id="remove-avatar" type="button">移除头像</button></div>
+                    <small>选择照片后可拖动和缩放，自主决定头像显示区域。</small>
+                  </div>
+                </div>
+                <div class="appearance-block">
+                  <div class="appearance-fields">
+                    <div class="profile-file-actions"><label class="secondary file-button">选择背景照片<input id="setting-background-file" type="file" accept="image/jpeg,image/png,image/webp"></label><button class="text-button" id="remove-background" type="button">移除背景</button></div>
+                    <label class="check-line"><input id="setting-background-enabled" type="checkbox">使用照片作为页面背景</label>
+                    <label class="range-setting"><span class="range-setting-head"><span>背景遮罩</span><output id="background-overlay-copy">72%</output></span><input id="setting-background-overlay" type="range" min="0.45" max="0.92" step="0.01"></label>
+                  </div>
+                </div>
+                <div class="button-theme-editor">
+                  <div><strong>全局按钮颜色</strong><small>同步应用到主按钮、次按钮、播放键、选中态和焦点态。</small></div>
+                  <label class="color-picker"><input id="setting-button-color" type="color" value="#9fe7c5"><output id="button-color-copy">#9FE7C5</output></label>
+                  <div class="button-theme-preview" aria-label="按钮颜色预览"><button class="primary" type="button">主按钮</button><button class="secondary" type="button">次按钮</button><button class="audio-button audio-button-compact" type="button" aria-label="播放预览"><img src="assets/graphic-eq-round.svg" alt=""></button></div>
+                </div>
+                <div id="profile-form-status" class="form-status" aria-live="polite"></div>
+                <div class="profile-save-row"><button class="text-button" id="reset-appearance" type="button">恢复默认外观</button><button class="primary" id="save-profile-settings" type="button">保存个人资料与主题</button></div>
+              </section>
+              <section class="settings-section" id="settings-plan"><p class="eyebrow">STUDY PLAN</p><h2>学习计划</h2><div id="catalog-settings" class="catalog-settings"></div><label class="filter-setting"><input id="setting-filter-basic" type="checkbox"><span><b>过滤基础词（推荐）</b><small>基础词仍可查；不会自动进入分类词库、今日新词、同义替换干扰项或自由听写。已学习和手动加入的词不受影响。</small></span></label><div class="form-grid"><label>每日新词上限<input id="setting-daily-limit" type="number" min="0" max="100"></label><label>目标 Band<select id="setting-band"><option>6.0</option><option>6.5</option><option>7.0</option><option>7.5</option><option>8.0</option></select></label></div><label>重点话题（用逗号分隔）<input id="setting-topics" placeholder="Environment & Energy, Technology & AI"></label><label>目标记忆率<select id="setting-retention"><option value="0.85">85% · 复习更轻</option><option value="0.9">90% · 推荐</option><option value="0.95">95% · 复习更多</option></select></label><button class="primary" id="save-study-settings">保存学习计划</button></section>
+              <section class="settings-section" id="settings-training"><p class="eyebrow">TRAINING</p><h2>训练偏好</h2><div class="form-grid"><label>默认听写题量<input id="setting-dictation-count" type="number" min="5" max="100"></label><label>口音<select id="setting-voice-lang"><option value="en-GB">英音</option><option value="en-US">美音</option></select></label></div><label class="setting-field"><span>发音来源</span><select id="setting-voice-provider"><option value="google">Google 翻译发音（推荐）</option><option value="system">系统离线语音</option></select></label><div class="voice-setting-row"><label class="setting-field"><span>系统回退音色</span><select id="setting-voice-name"><option value="">自动选择</option></select></label><button class="secondary voice-preview-button" id="preview-voice" type="button">试听发音</button></div><small class="voice-quality-copy" id="voice-quality-copy">Google 模式只会发送待播放的单词或短语；不可用时自动改用本机语音。</small><label class="range-setting"><span class="range-setting-head"><span>语速</span><output id="speech-rate-copy">0.82×</output></span><input id="setting-speech-rate" type="range" min="0.5" max="1.2" step="0.05"></label><label class="check-line"><input id="setting-autoplay" type="checkbox">进入拼写题时自动播放</label><button class="primary" id="save-training-settings">保存训练偏好</button></section>
+              <section class="settings-section" id="settings-api"><p class="eyebrow">PERSONAL AI CONNECTION</p><h2>API 管理</h2><p>密钥只写入你的个人配置文件，页面和接口不会读取或显示完整密钥。</p><form id="api-form"><label>Base URL<input id="api-base-url" type="url" autocomplete="off" placeholder="https://api.openai.com/v1" required></label><label>模型名称<input id="api-model" autocomplete="off" placeholder="gpt-4o-mini / deepseek-chat" required></label><label>API Key<input id="api-key" type="password" autocomplete="new-password" placeholder="留空表示继续使用已保存的密钥"></label><div id="api-form-status" class="form-status" aria-live="polite"></div><footer><button type="button" class="text-button danger-text" id="clear-api-config">清除配置</button><span></span><button type="button" class="secondary" id="test-api-config">测试连接</button><button type="submit" class="primary">保存 API</button></footer></form></section>
+              <section class="settings-section data-management" id="settings-data">
+                <p class="eyebrow">DATA</p><h2>数据管理</h2><p>备份会包含个人词、设置、复习与对话，不包含内置词库和 API Key。</p>
+                <div class="data-group">
+                  <header><strong>备份与迁移</strong><small>保存一份可重新导入的本地 JSON 文件</small></header>
+                  <div class="data-tool-row"><span><b>导出完整备份</b><small>下载当前个人学习数据</small></span><button class="secondary" id="export-data">导出</button></div>
+                  <div class="data-tool-row"><span><b>导入已有备份</b><small>先预览内容，再决定合并或替换</small></span><label class="secondary file-button">选择文件<input id="import-data" type="file" accept="application/json"></label></div>
+                </div>
+                <div class="data-group danger-zone">
+                  <header><strong>选择性清理</strong><small>操作前会再次确认，不影响内置词库</small></header>
+                  <div class="data-tool-row"><span><b>听写训练记录</b><small>只移除自由练习与听写成绩</small></span><button class="text-button danger-text" data-clear-scope="dictation">清除</button></div>
+                  <div class="data-tool-row"><span><b>AI 对话历史</b><small>删除所有助教会话与消息</small></span><button class="text-button danger-text" data-clear-scope="chats">清除</button></div>
+                  <div class="data-tool-row"><span><b>学习进度</b><small>重置卡片、复习日志与训练会话</small></span><button class="text-button danger-text" data-clear-scope="learning">重置</button></div>
+                </div>
+                <div id="data-status" class="form-status"></div>
+              </section>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div class="mobile-overlay" id="mobile-overlay"></div>
+  <div class="drawer-overlay" id="word-drawer" aria-hidden="true">
+    <section class="word-drawer" role="dialog" aria-modal="true" aria-labelledby="word-drawer-title">
+      <header><div><p class="eyebrow">PERSONAL VOCABULARY</p><h2 id="word-drawer-title">编辑词条</h2></div><button class="icon-button" data-close-drawer aria-label="关闭">×</button></header>
+      <form id="word-edit-form">
+        <input id="word-edit-id" type="hidden">
+        <label>单词<input id="word-edit-name" disabled></label>
+        <label>中文释义<textarea id="word-edit-definition" rows="3"></textarea></label>
+        <div class="form-grid"><label>Band<input id="word-edit-band"></label><label>词性<input id="word-edit-pos"></label></div>
+        <label>话题<select id="word-edit-topic"></select></label>
+        <label>相关话题（逗号分隔）<input id="word-edit-related-topics"></label>
+        <label>学习用途<select id="word-edit-learning-mode"><option value="auto">自动判断</option><option value="recognition">只认识</option><option value="production">要会写</option></select></label>
+        <label>学习状态<select id="word-edit-status"><option value="learning">学习中</option><option value="review">待复习</option><option value="mastered">已掌握（按 Easy 调度）</option><option value="paused">暂停全部复习</option></select></label>
+        <label>标签（逗号分隔）<input id="word-edit-tags"></label>
+        <label>学习笔记<textarea id="word-edit-note" rows="4"></textarea></label>
+        <footer><button type="button" class="secondary" data-close-drawer>取消</button><button type="submit" class="primary">保存修改</button></footer>
+      </form>
+    </section>
+  </div>
+  <div class="crop-overlay" id="profile-cropper" aria-hidden="true">
+    <section class="crop-dialog" role="dialog" aria-modal="true" aria-labelledby="crop-title">
+      <header><div><p class="eyebrow">CROP PHOTO</p><h2 id="crop-title">选择显示区域</h2><p id="crop-copy">拖动照片调整位置，使用滑块缩放。</p></div><button class="icon-button" id="crop-close" type="button" aria-label="关闭裁剪">×</button></header>
+      <div class="crop-stage" id="crop-stage"><canvas id="crop-canvas"></canvas><div class="crop-guide" aria-hidden="true"></div></div>
+      <label class="crop-zoom"><span>缩放</span><input id="crop-zoom" type="range" min="1" max="3" step="0.01" value="1"></label>
+      <div id="crop-status" class="form-status" aria-live="polite"></div>
+      <footer><button class="secondary" id="crop-cancel" type="button">取消</button><button class="primary" id="crop-confirm" type="button">使用这个区域</button></footer>
+    </section>
+  </div>
+  <div class="toast" id="toast" aria-live="polite"></div>
+  <script src="dict.js?v=20260814-byok"></script>
+  <script src="data/ielts-catalog.js?v=20260814-byok"></script>
+  <script src="speech.js?v=20260814-byok"></script>
+  <script src="app.js?v=20260814-notes"></script>
+  <script src="markdown.js?v=20260814-byok"></script>
+  <script src="notes-app.js?v=20260814-notes"></script>
+  <script src="ai-app.js?v=20260814-notes"></script>
+  <script src="study-app.js?v=20260814-byok"></script>
+</body>
+</html>
