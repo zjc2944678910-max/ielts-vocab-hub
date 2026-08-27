@@ -14,3 +14,10 @@
 - License: MIT
 - The official scheduler package is vendored under `vendor/fsrs` so local review works offline.
 
+## KaTeX
+
+- Source: https://github.com/KaTeX/KaTeX
+- Version: `0.18.4`
+- License: MIT
+- Vendored under `vendor/katex` for offline math rendering in notes and AI messages.
+
