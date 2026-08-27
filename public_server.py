@@ -36,7 +36,7 @@ MAX_BODY = 4_500_000
 MAX_DOWNLOAD = 105_000_000
 STATIC_FILES = {
     "/index.html", "/styles.css", "/dict.js", "/speech.js", "/app.js",
-    "/markdown.js", "/ai-app.js", "/notes-app.js", "/study-app.js", "/runtime-config.js",
+    "/markdown.js", "/ai-app.js", "/notes-app.js", "/study-app.js", "/speaking-app.js", "/runtime-config.js",
     "/startup-redirect.js", "/data/ielts-catalog.js",
     "/assets/graphic-eq-round.svg",
 }
@@ -103,7 +103,7 @@ class PublicGateway(BaseHTTPRequestHandler):
     def security_headers(self) -> None:
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "same-origin")
-        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(self), geolocation=()")
 
     def send_simple(self, status: int, message: str) -> None:
         raw = message.encode("utf-8")

@@ -28,4 +28,30 @@ const softBreaks = markdown.render("原因：reason\n问题：problem\n解决方
 assert.match(softBreaks, /原因：reason<br>问题：problem<br>解决方案：solution/);
 assert.doesNotMatch(markdown.render("first\nsecond"), /<br>/);
 
+global.katex = {
+  renderToString(source, options) {
+    assert.equal(options.trust, false);
+    assert.equal(options.throwOnError, false);
+    if (source.includes("broken")) return '<span class="katex-error">bad</span>';
+    return `<span class="katex">${markdown.escapeHtml(source)}</span>`;
+  }
+};
+const math = markdown.render("行内 $a^2 + b^2 = c^2$ 和 \\(x+1\\)。\n\n$$\\frac{1}{2}$$\n\n\\[y = mx + b\\]");
+assert.match(math, /class="math-inline"/);
+assert.match(math, /class="math-display"/);
+assert.match(math, /\\frac\{1\}\{2\}/);
+assert.match(markdown.render("`$not_math$`\n\n```js\nconst price = '$5';\n```"), /<code>\$not_math\$<\/code>/);
+assert.doesNotMatch(markdown.render("`$not_math$`"), /math-inline/);
+assert.match(markdown.render("错误 $broken$，箭头 $\\rightarrow$"), /math-error/);
+
+const cited = markdown.render("参见 [N5] 和 [N8,N9]，忽略 [N404]。", {citations: [
+  {ref:"N5", note_id:"note-5", title:"词义"},
+  {ref:"N8", note_id:"note-8", title:"写作"},
+  {ref:"N9", note_id:"note-9", title:"搭配"},
+]});
+assert.match(cited, /data-open-note="note-5"/);
+assert.match(cited, /data-open-note="note-8"/);
+assert.match(cited, /data-open-note="note-9"/);
+assert.doesNotMatch(cited, /data-open-note="N404"/);
+
 console.log("markdown renderer tests passed");

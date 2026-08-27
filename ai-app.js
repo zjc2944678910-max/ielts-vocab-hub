@@ -12,8 +12,11 @@
   const state = {
     configured: false, chats: [], activeChat: null, messages: [], personalWords: [],
     streaming: false, currentContext: null, migrated: false, linkedNotes: [],
+    routing: { mode: "none", model: "", fallback: false, defaultMode: "smart_free", defaultModel: "", deepseek: false },
+    modelCatalog: [],
     chatsRefreshedAt: 0, chatsRefreshPromise: null, chatSelectionToken: 0,
-    chatCache: new Map(), chatLoads: new Map(), chatHtmlCache: new Map(), messageRenderFrame: 0
+    chatCache: new Map(), chatLoads: new Map(), chatHtmlCache: new Map(), messageRenderFrame: 0,
+    chatReconcileTimers: new Map(), chatReconcileAttempts: new Map()
   };
   const chatSidebarMedia = window.matchMedia("(min-width: 721px)");
   const chatSidebarPreference = () => localStorage.getItem("ielts_chat_history_collapsed") === "true";
@@ -23,6 +26,52 @@
   const attr = value => esc(value).replace(/`/g, "&#96;");
   const norm = value => String(value || "").trim().toLowerCase();
   const hasChinese = value => /[\u3400-\u9fff]/.test(String(value || ""));
+  const TASK_PROFILE_LABELS = {translation:"翻译",word_enrichment:"词条扩展",vocabulary_qa:"词汇问答",ielts_writing:"雅思写作",study_qa:"学习问答",note_tutor:"笔记助教"};
+  const CHAT_MODEL_STORAGE_KEY = "ielts_chat_model_selection_v1";
+  const CHAT_RECONCILE_MAX_ATTEMPTS = 40;
+
+  function parseModelSelection(value) {
+    const raw = String(value || "follow_global");
+    return raw.startsWith("fixed_free:")
+      ? {mode:"fixed_free", model:raw.slice("fixed_free:".length)}
+      : {mode:["follow_global","smart_free","deepseek"].includes(raw) ? raw : "follow_global", model:""};
+  }
+
+  function selectionValue(selection) {
+    return selection?.mode === "fixed_free" && selection.model ? `fixed_free:${selection.model}` : selection?.mode || "follow_global";
+  }
+
+  function readChatModelMap() {
+    try {
+      const value = JSON.parse(localStorage.getItem(CHAT_MODEL_STORAGE_KEY) || "{}");
+      return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    } catch { return {}; }
+  }
+
+  function chatPreferenceKey() { return state.activeChat?.id || "__draft__"; }
+  function currentChatSelection() { return parseModelSelection(selectionValue(readChatModelMap()[chatPreferenceKey()])); }
+
+  function saveChatSelection(selection) {
+    const map = readChatModelMap();
+    map[chatPreferenceKey()] = parseModelSelection(selectionValue(selection));
+    try { localStorage.setItem(CHAT_MODEL_STORAGE_KEY, JSON.stringify(map)); } catch { /* localStorage is optional */ }
+  }
+
+  function migrateDraftSelection(chatId) {
+    if (!chatId) return;
+    const map = readChatModelMap();
+    if (map.__draft__) map[chatId] = map.__draft__;
+    delete map.__draft__;
+    try { localStorage.setItem(CHAT_MODEL_STORAGE_KEY, JSON.stringify(map)); } catch { /* localStorage is optional */ }
+  }
+
+  function routeLabel(route = {}) {
+    const model = route.actual_model || route.model || "";
+    const task = TASK_PROFILE_LABELS[route.task_profile] || "";
+    if (route.source === "free_model") return [route.selection_mode === "fixed_free" ? "指定免费" : "智能免费", task, model || "OpenRouter"].filter(Boolean).join(" · ");
+    if (route.source === "fallback_model") return [route.fallback ? "DeepSeek 兜底" : "DeepSeek", task, model || "已配置模型"].filter(Boolean).join(" · ");
+    return "";
+  }
 
   async function api(path, options = {}) {
     const response = await fetch(`${API}${path}`, {
@@ -45,29 +94,108 @@
   function openDrawer() { $("#word-drawer").classList.add("open"); $("#word-drawer").setAttribute("aria-hidden", "false"); }
   function closeDrawer() { $("#word-drawer").classList.remove("open"); $("#word-drawer").setAttribute("aria-hidden", "true"); }
 
+  function renderModelSelectors() {
+    const modelOption = model => `<option value="fixed_free:${attr(model.id)}">${model.recommended ? "推荐 · " : ""}${esc(model.name || model.id)}</option>`;
+    const freeOptions = state.modelCatalog.filter(model => model.available).map(modelOption).join("");
+    const chatProfiles = new Set(["vocabulary_qa","ielts_writing","study_qa","note_tutor"]);
+    const chatFreeOptions = state.modelCatalog.filter(model => model.available && (model.task_profiles || []).some(profile => chatProfiles.has(profile))).map(modelOption).join("");
+    const savedFixed = state.routing.defaultMode === "fixed_free" && state.routing.defaultModel && !state.modelCatalog.some(model => model.id === state.routing.defaultModel)
+      ? `<option value="fixed_free:${attr(state.routing.defaultModel)}">${esc(state.routing.defaultModel)}</option>` : "";
+    const deepseekOption = `<option value="deepseek" ${state.routing.deepseek ? "" : "disabled"}>DeepSeek${state.routing.deepseek ? "" : "（未配置）"}</option>`;
+    const defaultSelect = $("#api-default-model");
+    if (defaultSelect) {
+      defaultSelect.innerHTML = `<option value="smart_free">智能免费</option>${savedFixed}${freeOptions ? `<optgroup label="固定免费模型">${freeOptions}</optgroup>` : ""}${deepseekOption}`;
+      defaultSelect.value = state.routing.defaultMode === "fixed_free" ? `fixed_free:${state.routing.defaultModel}` : state.routing.defaultMode;
+      if (!defaultSelect.value) defaultSelect.value = "smart_free";
+    }
+    const chatSelect = $("#chat-model-select");
+    if (chatSelect) {
+      const selection = currentChatSelection();
+      const missingFixed = selection.mode === "fixed_free" && selection.model && !state.modelCatalog.some(model => model.id === selection.model)
+        ? `<option value="fixed_free:${attr(selection.model)}">${esc(selection.model)}</option>` : "";
+      chatSelect.innerHTML = `<option value="follow_global">跟随全局</option><option value="smart_free">智能免费</option>${missingFixed}${chatFreeOptions ? `<optgroup label="指定免费模型">${chatFreeOptions}</optgroup>` : ""}${deepseekOption}`;
+      chatSelect.value = selectionValue(selection);
+      if (!chatSelect.value) chatSelect.value = "follow_global";
+      const status = $("#chat-model-status");
+      if (status) status.textContent = selection.mode === "follow_global" ? "跟随全局设置" : selection.mode === "smart_free" ? "本对话自动按任务选择" : selection.mode === "deepseek" ? "本对话使用 DeepSeek" : `本对话固定：${selection.model}`;
+    }
+  }
+
+  async function refreshModelCatalog() {
+    try {
+      const data = await api("/api/models");
+      state.modelCatalog = Array.isArray(data.models) ? data.models : [];
+    } catch { state.modelCatalog = []; }
+    renderModelSelectors();
+  }
+
   async function refreshConfig() {
     try {
       const config = await api("/api/config/status");
       state.configured = config.configured;
-      $("#api-status-text").textContent = config.configured ? config.model : "API 未配置";
+      state.routing = { mode: config.routing_mode || "none", model: config.model || "", fallback: Boolean(config.fallback_configured), defaultMode: config.default_mode || "smart_free", defaultModel: config.default_model || "", deepseek: Boolean(config.deepseek_configured) };
+      $("#api-status-text").textContent = !config.configured ? "API 未配置" : config.default_mode === "deepseek" ? (config.manual_model || "DeepSeek") : config.default_mode === "fixed_free" ? (config.default_model || "固定免费模型") : "智能免费";
       $("#open-api-settings").classList.toggle("configured", config.configured);
-      $("#api-base-url").value = config.base_url || "";
-      $("#api-model").value = config.model || "";
-      $("#api-key").placeholder = config.configured ? "已保存；留空表示不修改" : "输入 API Key";
+      $("#api-openrouter-enabled").checked = Boolean(config.openrouter_configured);
+      $("#api-base-url").value = config.manual_base_url || (config.routing_mode === "manual" ? config.base_url || "" : "");
+      $("#api-model").value = config.manual_model || (config.routing_mode === "manual" ? config.model || "" : "");
+      $("#api-openrouter-key").placeholder = config.openrouter_configured ? "已保存；留空表示不修改" : "输入 OpenRouter API Key";
+      $("#api-key").placeholder = config.fallback_configured ? "已保存；留空表示不修改" : "输入备用模型 API Key";
+      $("#openrouter-catalog-status").textContent = config.free_catalog_checked_at ? `免费目录已校验：${new Date(config.free_catalog_checked_at).toLocaleString("zh-CN")}` : "免费目录尚未校验；首次请求时自动检查";
+      $("#fallback-config-status").textContent = config.fallback_configured ? `已配置：${config.manual_model || "DeepSeek"}` : "未配置";
+      $("#default-model-status").textContent = config.default_mode === "deepseek" ? "所有 AI 任务默认使用 DeepSeek" : config.default_mode === "fixed_free" ? `所有 AI 任务优先使用 ${config.default_model}` : "自动按任务选择免费模型，必要时使用 DeepSeek 兜底";
+      renderModelSelectors();
+      if (config.openrouter_configured) refreshModelCatalog();
     } catch {
       state.configured = false;
+      state.routing = { mode: "none", model: "", fallback: false, defaultMode: "smart_free", defaultModel: "", deepseek: false };
+      state.modelCatalog = [];
       $("#api-status-text").textContent = "本地 API 未连接";
       $("#open-api-settings").classList.remove("configured");
+      renderModelSelectors();
     }
   }
 
   function configPayload() {
-    return { base_url: $("#api-base-url").value.trim(), model: $("#api-model").value.trim(), api_key: $("#api-key").value.trim() };
+    const selected = parseModelSelection($("#api-default-model").value);
+    return {
+      version: 3,
+      default_mode: selected.mode,
+      default_model: selected.model,
+      openrouter: {
+        enabled: Boolean($("#api-openrouter-enabled").checked),
+        api_key: $("#api-openrouter-key").value.trim(),
+      },
+      manual: {
+        base_url: $("#api-base-url").value.trim(),
+        model: $("#api-model").value.trim(),
+        api_key: $("#api-key").value.trim(),
+      },
+    };
   }
 
   function readStorageArray(key) {
     try { const value = JSON.parse(localStorage.getItem(key) || "[]"); return Array.isArray(value) ? value : []; }
     catch { return []; }
+  }
+
+  const ROUTE_STORAGE_KEY = "ielts_chat_route_meta_v1";
+  function readRouteMap() {
+    try {
+      const value = JSON.parse(localStorage.getItem(ROUTE_STORAGE_KEY) || "{}");
+      return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    } catch { return {}; }
+  }
+  function rememberRoute(messageId, routing) {
+    if (!messageId || !routing?.source) return;
+    const map = readRouteMap(); map[messageId] = {...routing};
+    const keys = Object.keys(map);
+    keys.slice(0, Math.max(0, keys.length - 200)).forEach(key => delete map[key]);
+    try { localStorage.setItem(ROUTE_STORAGE_KEY, JSON.stringify(map)); } catch { /* localStorage is optional */ }
+  }
+  function hydrateRoutes(messages) {
+    const map = readRouteMap();
+    return (messages || []).map(message => message.routing || !map[message.id] ? message : {...message, routing: map[message.id]});
   }
 
   function preserveLegacyBackup() {
@@ -81,13 +209,13 @@
     event.preventDefault(); showFormStatus("正在保存…");
     try {
       await api("/api/config", { method: "POST", body: JSON.stringify(configPayload()) });
-      $("#api-key").value = ""; showFormStatus("配置已安全保存到你的个人空间。", "success"); await refreshConfig();
+      $("#api-key").value = ""; $("#api-openrouter-key").value = ""; showFormStatus("配置已安全保存到你的个人空间。", "success"); await refreshConfig();
     } catch (error) { showFormStatus(error.message, "error"); }
   }
 
   async function testConfig() {
-    showFormStatus("正在连接模型…");
-    try { const result = await api("/api/config/test", { method: "POST", body: JSON.stringify(configPayload()) }); showFormStatus(`连接成功：${result.model}`, "success"); }
+    showFormStatus("正在校验当前路由和模型目录…");
+    try { const result = await api("/api/config/test", { method: "POST", body: JSON.stringify(configPayload()) }); showFormStatus(`连接成功：${routeLabel(result.routing) || result.model}`, "success"); await refreshConfig(); }
     catch (error) { showFormStatus(error.message, "error"); }
   }
 
@@ -181,7 +309,8 @@
       const data = await api("/api/analyze", { method: "POST", body: JSON.stringify({ word_entry: item }) });
       const a = data.analysis;
       if (data.word) { state.personalWords = [data.word, ...state.personalWords.filter(word => word.id !== data.word.id)]; window.VocabAtelier?.mergePersonalWords(state.personalWords); }
-      target.innerHTML = `<div class="ai-analysis"><h4>✦ AI 深度解析 · Band ${esc(a.band || "—")}</h4><p><strong>${esc(a.definition || "")}</strong></p><p>${esc(a.note || "")}</p>${a.collocations?.length ? `<p>搭配：${a.collocations.map(esc).join(" · ")}</p>` : ""}${a.synonyms?.length ? `<p>同义替换：${a.synonyms.map(esc).join(" · ")}</p>` : ""}</div>`;
+      const route = routeLabel(data.routing || {});
+      target.innerHTML = `<div class="ai-analysis"><h4>✦ AI 深度解析 · Band ${esc(a.band || "—")}${route ? ` <small class="message-route">${esc(route)}</small>` : ""}</h4><p><strong>${esc(a.definition || "")}</strong></p><p>${esc(a.note || "")}</p>${a.collocations?.length ? `<p>搭配：${a.collocations.map(esc).join(" · ")}</p>` : ""}${a.synonyms?.length ? `<p>同义替换：${a.synonyms.map(esc).join(" · ")}</p>` : ""}</div>`;
     } catch (error) { target.innerHTML = `<div class="ai-analysis"><h4>解析失败</h4><p>${esc(error.message)}</p></div>`; }
     finally { button.disabled = false; }
   }
@@ -219,6 +348,8 @@
   function createChat(context = null) {
     if (state.streaming) { window.VocabAtelier?.toast("请先停止当前回复"); return null; }
     if (state.activeChat?.draft && !context) { $("#chat-input").focus(); window.VocabAtelier?.toast("当前已经是空白对话"); return state.activeChat; }
+    const preferences = readChatModelMap(); delete preferences.__draft__;
+    try { localStorage.setItem(CHAT_MODEL_STORAGE_KEY, JSON.stringify(preferences)); } catch { /* localStorage is optional */ }
     state.activeChat = { id: null, title: context?.word ? `${context.word} 学习` : "新对话", current_context: context, draft: true };
     state.messages = []; state.currentContext = context; state.linkedNotes = []; renderChatList(); renderMessages(); updateChatHead(); renderChatNotes(); $("#chat-input").focus();
     return state.activeChat;
@@ -229,18 +360,61 @@
     const draft = state.activeChat;
     try {
       const data = await api("/api/chats", { method: "POST", body: JSON.stringify({ title: draft.title, current_context: draft.current_context }) });
+      migrateDraftSelection(data.chat.id);
       state.chats = [data.chat, ...state.chats.filter(chat => chat.id !== data.chat.id)]; state.activeChat = data.chat; state.currentContext = data.chat.current_context || null; renderChatList(); updateChatHead();
       if (state.linkedNotes.length) await persistChatNotes();
       return data.chat;
     } catch (error) { window.VocabAtelier?.toast(error.message); return null; }
   }
 
-  async function loadChat(id) {
-    if (state.chatCache.has(id)) return state.chatCache.get(id);
-    if (state.chatLoads.has(id)) return state.chatLoads.get(id);
+  function hasGeneratingMessage(messages = []) {
+    return messages.some(message => message.role === "assistant" && message.status === "generating" && !String(message.content || "").trim());
+  }
+
+  function clearChatReconcile(id) {
+    const timer = state.chatReconcileTimers.get(id);
+    if (timer) clearTimeout(timer);
+    state.chatReconcileTimers.delete(id);
+    state.chatReconcileAttempts.delete(id);
+  }
+
+  function scheduleChatReconcile(id) {
+    if (!id || state.activeChat?.id !== id || state.streaming || state.chatReconcileTimers.has(id)) return;
+    const cached = state.chatCache.get(id);
+    if (!cached || !hasGeneratingMessage(cached.messages)) { clearChatReconcile(id); return; }
+    const attempts = state.chatReconcileAttempts.get(id) || 0;
+    if (attempts >= CHAT_RECONCILE_MAX_ATTEMPTS) {
+      state.chatCache.delete(id);
+      state.chatHtmlCache.delete(id);
+      return;
+    }
+    const delay = Math.min(500 + attempts * 250, 3000);
+    const timer = setTimeout(async () => {
+      state.chatReconcileTimers.delete(id);
+      if (state.activeChat?.id !== id || state.streaming) { state.chatReconcileAttempts.delete(id); return; }
+      state.chatReconcileAttempts.set(id, attempts + 1);
+      try {
+        const data = await loadChat(id, { force: true });
+        if (state.activeChat?.id !== id || state.streaming) return;
+        state.messages = data.messages.map(message => ({...message}));
+        state.linkedNotes = data.notes.map(note => ({...note}));
+        renderMessages(); renderChatNotes();
+      } catch { scheduleChatReconcile(id); }
+    }, delay);
+    state.chatReconcileTimers.set(id, timer);
+  }
+
+  async function loadChat(id, { force = false } = {}) {
+    if (!force && state.chatCache.has(id)) {
+      const cached = state.chatCache.get(id);
+      if (hasGeneratingMessage(cached.messages)) scheduleChatReconcile(id); else clearChatReconcile(id);
+      return cached;
+    }
+    if (!force && state.chatLoads.has(id)) return state.chatLoads.get(id);
     const request = api(`/api/chats/${id}/messages`).then(data => {
-      const cached = { messages: data.messages || [], notes: data.notes || [] };
+      const cached = { messages: hydrateRoutes(data.messages || []), notes: data.notes || [] };
       state.chatCache.set(id, cached);
+      if (hasGeneratingMessage(cached.messages)) scheduleChatReconcile(id); else clearChatReconcile(id);
       return cached;
     }).finally(() => { if (state.chatLoads.get(id) === request) state.chatLoads.delete(id); });
     state.chatLoads.set(id, request);
@@ -249,7 +423,8 @@
 
   async function selectChat(id, { force = false } = {}) {
     const chat = state.chats.find(item => item.id === id); if (!chat) return;
-    if (!force && state.activeChat?.id === id && state.chatCache.has(id)) return;
+    if (!state.chatCache.has(id) && !state.chatReconcileTimers.has(id)) state.chatReconcileAttempts.delete(id);
+    if (!force && state.activeChat?.id === id && state.chatCache.has(id)) { scheduleChatReconcile(id); return; }
     const token = ++state.chatSelectionToken;
     state.activeChat = chat; state.currentContext = chat.current_context || null; renderChatList(); updateChatHead();
     const cached = !force && state.chatCache.get(id);
@@ -257,6 +432,7 @@
       state.messages = cached.messages.map(message => ({...message}));
       state.linkedNotes = cached.notes.map(note => ({...note}));
       renderMessages({ useCached: true }); renderChatNotes();
+      scheduleChatReconcile(id);
       return;
     }
     try {
@@ -278,6 +454,7 @@
     const chip = $("#chat-context-chip");
     if (state.currentContext?.word) { chip.innerHTML = `正在参考词条：<strong>${esc(state.currentContext.word)}</strong><button data-clear-context>×</button>`; chip.classList.remove("hidden"); }
     else { chip.classList.add("hidden"); chip.innerHTML = ""; }
+    renderModelSelectors();
   }
 
   function clearChatView() { state.activeChat = null; state.messages = []; state.currentContext = null; state.linkedNotes = []; renderMessages(); updateChatHead(); renderChatNotes(); }
@@ -316,9 +493,10 @@
     const content = waiting
       ? `<span class="message-loading" role="status">正在生成…</span>`
       : emptyReply ? `<span class="message-empty">此回复没有可显示内容，请重新生成。</span>`
-      : role === "assistant" && window.SafeMarkdown?.render ? window.SafeMarkdown.render(message.content || "") : esc(message.content || "");
+      : role === "assistant" && window.SafeMarkdown?.render ? window.SafeMarkdown.render(message.content || "", {citations: message.citations || []}) : esc(message.content || "");
     const citations = role === "assistant" && message.citations?.length ? `<div class="message-citations">${message.citations.map(source => `<button class="message-citation" data-open-note="${attr(source.note_id)}">[${esc(source.ref)}] ${esc(source.title)}${source.heading ? ` › ${esc(source.heading)}` : ""}</button>`).join("")}</div>` : "";
-    return `<article class="message ${role}"><div class="message-avatar">${role === "assistant" ? "AI" : "你"}</div><div class="message-content"><div class="message-role">${role === "assistant" ? "IELTS 助教" : "YOU"}</div><div class="message-text${role === "assistant" ? " markdown" : ""}">${content}</div>${citations}${message.status && message.status !== "complete" && message.status !== "generating" ? `<div class="message-status">${message.status === "aborted" ? "生成已停止" : "生成未完成"}</div>` : ""}${actions ? `<div class="action-list">${actions}</div>` : ""}<div class="message-tools">${role === "assistant" && message.content ? `<button data-copy-message data-index="${index}">复制回复</button><button data-save-message-note data-index="${index}">保存为笔记</button>` : ""}</div></div></article>`;
+    const route = role === "assistant" && message.routing ? routeLabel(message.routing) : "";
+    return `<article class="message ${role}"><div class="message-avatar">${role === "assistant" ? "AI" : "你"}</div><div class="message-content"><div class="message-role">${role === "assistant" ? "IELTS 助教" : "YOU"}</div>${route ? `<div class="message-route">${esc(route)}</div>` : ""}<div class="message-text${role === "assistant" ? " markdown" : ""}">${content}</div>${citations}${message.status && message.status !== "complete" && message.status !== "generating" ? `<div class="message-status">${message.status === "aborted" ? "生成已停止" : "生成未完成"}</div>` : ""}${actions ? `<div class="action-list">${actions}</div>` : ""}<div class="message-tools">${role === "assistant" && message.content ? `<button data-copy-message data-index="${index}">复制回复</button><button data-save-message-note data-index="${index}">保存为笔记</button>` : ""}</div></div></article>`;
   }
 
   function messagesHtml(messages = state.messages) {
@@ -363,7 +541,11 @@
     if (!regenerate && $("#search-all-notes-once")) $("#search-all-notes-once").checked = false;
     const assistant = { role: "assistant", content: "", status: "generating", actions: [], citations: [] }; state.messages.push(assistant); renderMessages(); setStreaming(true);
     try {
-      const response = await fetch(`${API}/api/chats/${state.activeChat.id}/messages`, { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(regenerate ? {regenerate:true} : {content, search_all_notes:searchAll}) });
+      const selection = currentChatSelection();
+      const requestPayload = regenerate ? {regenerate:true} : {content, search_all_notes:searchAll};
+      requestPayload.selection_mode = selection.mode;
+      requestPayload.requested_model = selection.model;
+      const response = await fetch(`${API}/api/chats/${state.activeChat.id}/messages`, { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(requestPayload) });
       if (!response.ok) { const data = await response.json(); throw new Error(data.error?.message || "发送失败"); }
       const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = "";
       while (true) {
@@ -373,12 +555,17 @@
           const eventName = block.split("\n").find(line => line.startsWith("event:"))?.slice(6).trim();
           const raw = block.split("\n").find(line => line.startsWith("data:"))?.slice(5).trim(); if (!raw) continue;
           const data = JSON.parse(raw);
+          if (eventName === "start") { assistant.id = data.message_id || assistant.id; assistant.routing = data.routing || {}; assistant.model = data.model || ""; scheduleMessagesRender(); }
+          if (eventName === "route") { assistant.routing = data.routing || assistant.routing || {}; assistant.model = data.model || assistant.model || ""; scheduleMessagesRender(); }
           if (eventName === "delta") { assistant.content += data.text || ""; scheduleMessagesRender(); }
           if (eventName === "replace") { assistant.content = data.text || ""; scheduleMessagesRender(); }
           if (eventName === "sources") { assistant.citations = data.sources || []; scheduleMessagesRender(); }
           if (eventName === "actions") { assistant.actions = data.actions || []; scheduleMessagesRender(); }
           if (eventName === "done") {
             assistant.status = data.status || "complete";
+            assistant.routing = data.routing || assistant.routing || {};
+            assistant.model = data.model || assistant.model || "";
+            rememberRoute(data.message_id || assistant.id, assistant.routing);
             if (!assistant.content.trim()) throw new Error("模型没有返回可显示内容，请重试。");
           }
           if (eventName === "error") throw new Error(data.message || "生成中断");
@@ -386,12 +573,22 @@
       }
       if (!assistant.content.trim()) throw new Error("模型没有返回可显示内容，请重试。");
       cacheActiveChat();
-      await refreshChats(state.activeChat.id, { force: true });
+      const completedRouting = assistant.routing ? {...assistant.routing} : null;
+      const completedChatId = state.activeChat?.id;
+      await refreshChats(completedChatId, { force: true });
+      // Routing metadata is intentionally UI-only (the message schema stays
+      // unchanged).  Reattach it after the forced refresh so the just-finished
+      // answer does not lose its free/fallback badge during list revalidation.
+      if (completedRouting && completedChatId && state.activeChat?.id === completedChatId) {
+        const latest = [...state.messages].reverse().find(message => message.role === "assistant");
+        if (latest) latest.routing = completedRouting;
+        renderMessages();
+      }
     } catch (error) { assistant.status = "error"; assistant.content ||= error.message; renderMessages(); }
     finally { cacheActiveChat(); setStreaming(false); }
   }
 
-  function setStreaming(value) { state.streaming = value; $("#stop-chat").classList.toggle("hidden", !value); $("#send-chat").classList.toggle("hidden", value); $("#chat-input").disabled = value; }
+  function setStreaming(value) { state.streaming = value; $("#stop-chat").classList.toggle("hidden", !value); $("#send-chat").classList.toggle("hidden", value); $("#chat-input").disabled = value; $("#chat-model-select").disabled = value; }
 
   async function stopChat() {
     if (!state.activeChat) return;
@@ -477,11 +674,13 @@
   function bind() {
     $("#open-api-settings").addEventListener("click", () => { showFormStatus(""); openModal(); });
     $("#api-form").addEventListener("submit", saveConfig); $("#test-api-config").addEventListener("click", testConfig); $("#clear-api-config").addEventListener("click", clearConfig);
+    $("#api-default-model").addEventListener("change", event => { const selection = parseModelSelection(event.target.value); $("#default-model-status").textContent = selection.mode === "deepseek" ? "所有 AI 任务默认使用 DeepSeek" : selection.mode === "fixed_free" ? `所有 AI 任务优先使用 ${selection.model}` : "自动按任务选择免费模型，必要时使用 DeepSeek 兜底"; });
     $("#chat-list").addEventListener("click", event => { const item = event.target.closest("[data-chat-id]"); if (item) selectChat(item.dataset.chatId); });
     $("#chat-history-toggle").addEventListener("click", () => setChatSidebarCollapsed(!$(".assistant-shell").classList.contains("history-collapsed")));
     chatSidebarMedia.addEventListener?.("change", () => setChatSidebarCollapsed(chatSidebarPreference(), false));
     $("#new-chat").addEventListener("click", () => createChat()); $("#mobile-new-chat").addEventListener("click", () => createChat()); $("#mobile-chat-select").addEventListener("change", event => { if (event.target.value) selectChat(event.target.value); }); $("#rename-chat").addEventListener("click", renameChat); $("#delete-chat").addEventListener("click", deleteChat);
     $("#chat-form").addEventListener("submit", sendChat); $("#stop-chat").addEventListener("click", stopChat); $("#regenerate-chat").addEventListener("click", () => sendChat(null, true));
+    $("#chat-model-select").addEventListener("change", event => { saveChatSelection(parseModelSelection(event.target.value)); renderModelSelectors(); });
     $("#chat-input").addEventListener("keydown", event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendChat(event); } });
     $("#chat-context-chip").addEventListener("click", event => { if (event.target.closest("[data-clear-context]")) clearContext(); });
     $("#choose-chat-notes").addEventListener("click", chooseChatNotes);

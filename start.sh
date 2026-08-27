@@ -31,14 +31,21 @@ if port_in_use "$PAGE_PORT"; then
 fi
 
 if port_in_use "$PROXY_PORT"; then
-  if proxy_ready; then
-    echo "⚠️ IELTS Vocab Hub 代理已在运行，将继续使用。"
+  PROXY_EXISTING="$(lsof -tiTCP:${PROXY_PORT} -sTCP:LISTEN | head -n 1 || true)"
+  PROXY_CMD="$(ps -p "${PROXY_EXISTING:-0}" -o args= 2>/dev/null || true)"
+  if [[ "${PROXY_CMD}" == *proxy.py* ]]; then
+    echo "↻ 重启本机词典代理以加载最新代码…"
+    kill "${PROXY_EXISTING}" 2>/dev/null || true
+    sleep 0.4
+  elif proxy_ready; then
+    echo "⚠️ 代理端口 ${PROXY_PORT} 已有服务，将继续使用。"
   else
     echo "❌ 代理端口 ${PROXY_PORT} 被其他程序占用。"
     echo "请先关闭占用该端口的程序，再重新启动。"
     exit 1
   fi
-else
+fi
+if ! port_in_use "$PROXY_PORT"; then
   python3 proxy.py > /tmp/ielts-vocab-proxy.log 2>&1 &
   PROXY_PID=$!
 fi

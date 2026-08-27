@@ -34,8 +34,6 @@
   let quizStreak = 0;
   let proxyOnline = ["localhost", "127.0.0.1"].includes(location.hostname);
   let lookupSequence = 0;
-  let dictionarySource = localStorage.getItem("ielts_dictionary_source") || "smart";
-  if (dictionarySource === "free") dictionarySource = "smart";
   let lookupController = null;
   let suggestionController = null;
   let suggestionTimer = null;
@@ -73,8 +71,30 @@
 
   function read(key, fallback) { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } }
   function save(key, value) { localStorage.setItem(key, JSON.stringify(value)); }
-  function norm(value) { return String(value || "").trim().toLowerCase(); }
+  function looseQuery(value) { return String(value || "").trim().replace(/\s+/g, " "); }
+  function norm(value) { return looseQuery(value).toLowerCase().replace(/(\w)-(\w)/g, "$1 $2"); }
   function hasChinese(value) { return /[\u3400-\u9fff]/.test(String(value || "")); }
+  function isTimeoutError(error) { return error?.name === "TimeoutError" || /timed out|timeout/i.test(String(error?.message || "")); }
+  function shouldAutoTranslate(query) {
+    const value = looseQuery(query);
+    return hasChinese(value) || /[\s-]/.test(value);
+  }
+  function dictionaryTimeout(source) {
+    if (source === "ai") return 40000;
+    if (source === "smart") return 20000;
+    return 8000;
+  }
+  function compactChinese(value) { return String(value || "").replace(/[\s·・．.]+/g, ""); }
+  function chineseTokens(query) {
+    const chars = compactChinese(query).replace(/[^\u3400-\u9fff]/g, "");
+    const tokens = [];
+    if (chars.length >= 2) tokens.push(chars);
+    if (chars.length >= 4) {
+      tokens.push(chars.slice(0, 2), chars.slice(2));
+      if (chars.length >= 6) tokens.push(chars.slice(0, 3), chars.slice(3));
+    }
+    return [...new Set(tokens.filter(token => token.length >= 2))];
+  }
   function needsChineseRefresh(item) {
     const source = item?.source || item?._source;
     return (source === "dictionary" && !hasChinese(item?.definition)) || (source === "cambridge" && !item?.auto_classified);
@@ -98,20 +118,26 @@
   }
 
   function switchTab(tab, updateHash = true) {
-    const target = $(`#view-${tab}`) ? tab : "lookup";
+    const requested = tab;
+    const mapped = {flashcards:"study", dictation:"study", paraphrase:"study"}[tab] || tab;
+    const target = $(`#view-${mapped}`) ? mapped : "lookup";
     $$(".view").forEach(view => view.classList.toggle("active", view.id === `view-${target}`));
     $$("[data-tab]").forEach(button => button.classList.toggle("active", button.dataset.tab === target));
     document.body.classList.toggle("assistant-mode", target === "assistant");
     document.body.classList.toggle("notes-mode", target === "notes");
     document.body.classList.remove("menu-open");
-    if (updateHash) history.replaceState(null, "", `#${target}`);
+    if (updateHash) history.replaceState(null, "", `#${target === "study" && (requested === "paraphrase" || requested === "dictation") ? requested : target}`);
     if (target === "library") {
       if (window.VocabStudy?.renderLibrary) window.VocabStudy.renderLibrary();
       else renderLibrary();
     }
-    if (target === "flashcards") window.VocabStudy?.renderReview?.();
-    if (target === "paraphrase") renderQuiz();
-    if (target === "dictation") window.VocabStudy?.renderDictation?.();
+    if (target === "study") {
+      window.VocabStudy?.renderStudy?.();
+      if (requested === "paraphrase") window.VocabStudy?.openParaphrase?.();
+      if (requested === "dictation") window.VocabStudy?.openDictation?.();
+    }
+    if (target === "speaking") window.VocabSpeaking?.activate?.();
+    else window.VocabSpeaking?.pause?.();
     if (target === "settings") window.VocabStudy?.renderSettings?.();
     if (target === "notebook") renderNotebook();
     if (target === "notes") window.VocabNotes?.activate?.();
@@ -141,19 +167,35 @@
   function matchesFor(query, limit = 7) {
     const q = norm(query);
     if (!q) return [];
+    const chinese = hasChinese(q);
+    const tokens = chinese ? chineseTokens(q) : [];
+    const pieces = tokens.slice(1);
     return dataset().map(item => {
       const word = norm(item.word);
-      let score = word === q ? 0 : word.startsWith(q) ? 10 : word.includes(q) ? 20 : 100 + levenshtein(word, q);
+      const definition = String(item.definition || "");
+      const collocations = (item.collocations || []).join(" ");
+      const blob = `${definition}\n${collocations}`;
+      let score = 1000;
+      if (chinese) {
+        if (tokens[0] && blob.includes(tokens[0])) score = 8;
+        if (pieces.length && pieces.every(token => blob.includes(token))) score = Math.min(score, 4);
+        else if (pieces.some(token => blob.includes(token))) score = Math.min(score, 16);
+      } else {
+        score = word === q ? 0 : word.startsWith(q) ? 10 : word.includes(q) ? 20 : norm(collocations).includes(q) ? 18 : 100 + levenshtein(word, q);
+      }
       if (store.saved.includes(item.word)) score -= 5;
       else if (item.classification_source === "curated") score -= 2;
       return { item, score };
-    }).filter(x => x.score <= 22 || levenshtein(norm(x.item.word), q) <= 2).sort((a, b) => a.score - b.score || a.item.word.localeCompare(b.item.word)).slice(0, limit).map(x => x.item);
+    }).filter(x => chinese ? x.score <= 20 : (x.score <= 22 || levenshtein(norm(x.item.word), q) <= 2)).sort((a, b) => a.score - b.score || a.item.word.localeCompare(b.item.word)).slice(0, limit).map(x => x.item);
   }
 
   function renderSuggestionItems(query, items) {
     const box = $("#suggestions");
     if (!query) return box.classList.remove("open");
-    box.innerHTML = items.length ? items.map(item => `<button type="button" class="suggestion" data-word="${attr(item.word)}"><b>${esc(item.word)}</b><span>${esc(item.definition)}</span></button>`).join("") : `<button type="button" class="suggestion" data-word="${attr(query)}"><b>查询 “${esc(query)}”</b><span>${hasChinese(query) ? "Cambridge 中英 / AI 翻译" : "Oxford / ECDICT 本地优先 / Cambridge 按需"}</span></button>`;
+    const phraseQuery = hasChinese(query) || query.includes(" ");
+    const searchRow = `<button type="button" class="suggestion suggestion-query" data-word="${attr(query)}"><b>查询 “${esc(query)}”</b><span>${hasChinese(query) ? "本地词库 / Google 中译英" : "本地词库 / Google 英译中"}</span></button>`;
+    const rows = items.map(item => `<button type="button" class="suggestion" data-word="${attr(item.word)}"><b>${esc(item.word)}</b><span>${esc(item.definition)}</span></button>`).join("");
+    box.innerHTML = phraseQuery ? `${searchRow}${rows}` : (rows || searchRow);
     box.classList.add("open");
   }
 
@@ -182,24 +224,6 @@
     }, delay);
   }
 
-  const DICTIONARY_LABELS = { smart: "智能判断", cambridge: "Cambridge 英中", cambridge_zh_en: "Cambridge 中英", oxford: "Oxford 本机英汉", ecdict: "ECDICT 本地", noad: "Oxford 英英（非翻译）", free: "Free Dictionary 英英", ai: "AI 翻译" };
-
-  function setDictionarySource(source) {
-    dictionarySource = DICTIONARY_LABELS[source] ? source : "smart";
-    localStorage.setItem("ielts_dictionary_source", dictionarySource);
-    $$('[data-dictionary-source]').forEach(button => button.classList.toggle("active", button.dataset.dictionarySource === dictionarySource));
-    const notes = {
-      smart: "自动识别英文词、英文短语、中文词语和中文句子；词典优先，AI 按需回退。",
-      cambridge: "英文查中文，保留多词性、多义项和英式发音；重定向不会冒充原词。",
-      cambridge_zh_en: "中文查英文，返回多个候选表达及其语域，不强行只选一个答案。",
-      oxford: "本机 Oxford 英汉词库，完全离线；仅私有实例可用。",
-      ecdict: "完全离线，适合 CET 词汇与基础中文释义。",
-      noad: "本机 Oxford 英英词典；只在你主动打开时显示，不是中文翻译。",
-      free: "仅在你主动打开时显示英文释义，不是中文翻译。",
-      ai: "适合完整句子、未收录短语和语境翻译；需要先配置 API。"
-    };
-    $("#dictionary-source-note").textContent = notes[dictionarySource];
-  }
 
   function freeDictionaryItem(entries, query) {
     const entry = (entries || []).find(item => norm(item.word) === query);
@@ -216,11 +240,11 @@
 
   function renderSourceCoverage(sources = []) {
     if (!sources.length) return "";
-    const label = {cambridge:"Cambridge",oxford:"Oxford 英汉",ecdict:"ECDICT",noad:"Oxford 英英",free:"Free Dictionary"};
+    const label = {oxford:"Oxford 英汉",ecdict:"ECDICT",google:"Google 翻译",local:"本地词库"};
     return `<div class="source-coverage">${sources.map(item => `<span class="${item.status === "ok" ? "available" : ""}"><i></i>${esc(label[item.id] || item.id)}${item.status === "ok" ? ` · ${Number(item.sense_count) || 0} 义` : item.status === "no_chinese" ? " · 无中文释义" : item.status === "unavailable" ? " · 暂不可用" : " · 无精确词条"}</span>`).join("")}</div>`;
   }
 
-  function isDictionaryMatch(item) { return Boolean(item?.exact || item?.match_kind === "inflection"); }
+  function isDictionaryMatch(item) { return Boolean(item?.exact || item?.match_kind === "inflection" || item?.match_kind === "phrase"); }
 
   function hasChineseDictionaryDefinition(item) {
     const definitions = [item?.definition, ...(item?.senses || []).map(sense => sense?.definition)];
@@ -228,7 +252,7 @@
   }
 
   function showAlternative(query, item, sources = []) {
-    $("#word-detail").innerHTML = `${renderSourceCoverage(sources)}<div class="dictionary-notice"><p class="eyebrow">未找到精确词条</p><h2>“${esc(query)}” 不是 “${esc(item.headword || item.word)}”</h2><p>词典把你的查询跳转到了另一个词。为了避免记错，页面没有自动替换原词。</p><div><button class="secondary" data-word="${attr(item.headword || item.word)}">查看 ${esc(item.headword || item.word)}</button><button class="text-button" data-dictionary-source-jump="ai">改用 AI 翻译原短语</button></div></div>`;
+    $("#word-detail").innerHTML = `${renderSourceCoverage(sources)}<div class="dictionary-notice"><p class="eyebrow">未找到精确词条</p><h2>“${esc(query)}” 不是 “${esc(item.headword || item.word)}”</h2><p>本地词库把查询指到了另一个词，没有自动替换。</p><div><button class="secondary" data-word="${attr(item.headword || item.word)}">查看 ${esc(item.headword || item.word)}</button></div></div>`;
   }
 
   function renderTranslationResult(item, source) {
@@ -243,20 +267,26 @@
       const explanation = item.direction === "zh-en" ? entry.definition_en : "";
       return `<article class="translation-item"><div class="sense-index">${String(index + 1).padStart(2,"0")}</div><div><header><button class="translation-expression" data-lookup-word="${attr(english)}">${esc(english)}</button><button class="mini-audio" data-speak="${attr(english)}" aria-label="播放 ${attr(english)} 发音"><img src="assets/graphic-eq-round.svg" alt="" aria-hidden="true"></button>${entry.pos ? `<span>${esc(entry.pos)}</span>` : ""}</header>${translation ? `<p>${esc(translation)}</p>` : ""}${explanation ? `<small>${esc(explanation)}</small>` : ""}${examples.map(example => `<div class="sense-example">${esc(example.en)}${example.cn ? `<small>${esc(example.cn)}</small>` : ""}</div>`).join("")}</div></article>`;
     }).join("");
-    const sourceLink = isAi ? "AI 生成内容，请结合语境核对" : `<a href="${attr(item.source_url || "https://dictionary.cambridge.org/dictionary/chinese-simplified-english/")}" target="_blank" rel="noopener noreferrer">Cambridge 中英词典 ↗</a>`;
-    $("#word-detail").innerHTML = `<section class="translation-result"><header><div><p class="eyebrow">${esc(direction)} · ${isAi ? "AI TRANSLATION" : "CAMBRIDGE DICTIONARY"}</p><h2>${esc(item.query)}</h2></div><span class="source-badge ${isAi ? "ai" : ""}">${isAi ? "AI 翻译" : "词典结果"}</span></header><p class="translation-guidance">${isAi ? "以下表达由 AI 根据语境生成，不会自动加入生词本。点击英文可继续查词。" : "Cambridge 返回了多个英文候选；请根据词性、语域和例句选择最符合语境的一项。"}</p><div class="translation-list">${rows}</div><div class="source-line">来源：${sourceLink}</div></section>`;
+    const engine = item.source === "google" ? "Google 翻译" : item.source === "local" ? "本地词库" : isAi ? "AI 翻译" : "词典结果";
+    const sourceLink = isAi ? "AI 生成内容，请结合语境核对" : item.source === "google" ? `<a href="${attr(item.source_url || "https://translate.google.com/?hl=zh-CN")}" target="_blank" rel="noopener noreferrer">Google 翻译 ↗</a>` : "本地词库";
+    const route = item.ai_meta || item.routing || {};
+    const routeLabel = route.source === "free_model" ? `免费模型 · ${route.actual_model || route.model || "OpenRouter"}` : route.source === "fallback_model" ? `备用模型 · ${route.actual_model || route.model || "已配置模型"}` : "";
+    const routeNotice = isAi && routeLabel ? `<span class="ai-route-notice">${esc(routeLabel)}</span>` : "";
+    $("#word-detail").innerHTML = `<section class="translation-result"><header><div><p class="eyebrow">${esc(direction)} · ${esc(engine.toUpperCase())}</p><h2>${esc(item.query)}</h2></div><span class="source-badge ${isAi ? "ai" : ""}">${esc(engine)}</span></header><p class="translation-guidance">${isAi ? "以下表达由 AI 根据语境生成，不会自动加入生词本。点击英文可继续查词。" : "下面是对应表达，点击英文可继续查词。"}</p>${routeNotice}<div class="translation-list">${rows}</div><div class="source-line">来源：${sourceLink}</div></section>`;
+  }
+
+  function friendlyLookupError(message) {
+    const text = String(message || "");
+    if (/\$\.|未通过本地校验|expressions|invalid_ai_json/.test(text)) return "翻译没有返回可用结果，请再试一次。";
+    return text;
   }
 
   function renderNotFound(query, source, local, message = "") {
     if (local && source === "smart") { renderWord(local, local._discovered ? "个人词库" : "精选雅思词库"); return; }
     const near = matchesFor(query, 1)[0];
     const suggestion = near && norm(near.word) !== query && levenshtein(norm(near.word), query) <= 2 ? `<button class="secondary" data-word="${attr(near.word)}">是否要查 ${esc(near.word)}？</button>` : "";
-    const configAction = /API|配置/.test(message) ? `<button class="secondary" data-open-api-settings>前往 API 设置</button>` : "";
-    const aiAction = source !== "ai" && !configAction && (hasChinese(query) || query.includes(" ")) ? `<button class="primary inline-primary" data-dictionary-source-jump="ai">改用 AI 翻译</button>` : "";
-    const freeAction = source === "smart" && !hasChinese(query) && !configAction ? `<button class="secondary" data-dictionary-source-jump="noad">查看本机 Oxford 英英释义（非翻译）</button><button class="text-button" data-dictionary-source-jump="free">查看在线英英释义（非翻译）</button>` : "";
-    const smartAction = source !== "smart" && !configAction ? `<button class="secondary" data-dictionary-source-jump="smart">改用智能判断</button>` : "";
-    const guidance = aiAction ? "这类组合短语不一定是词典词头，可以交给 AI 根据语境生成自然表达。" : freeAction ? "智能查词只展示中文释义；如需英文定义，请手动打开下方入口。" : "你可以切换上方来源再试。";
-    $("#word-detail").innerHTML = `<div class="dictionary-notice"><p class="eyebrow">NO RESULT</p><h2>没有找到 “${esc(query)}”</h2><p>${esc(message || `${DICTIONARY_LABELS[source]} 没有返回可用结果。`)} ${esc(guidance)}</p><div>${aiAction}${freeAction}${smartAction}${suggestion}${configAction}</div></div>`;
+    const configAction = /API|配置/.test(friendlyLookupError(message)) ? `<button class="secondary" data-open-api-settings>前往 API 设置</button>` : "";
+    $("#word-detail").innerHTML = `<div class="dictionary-notice"><p class="eyebrow">NO RESULT</p><h2>没有找到 “${esc(query)}”</h2><p>${esc(friendlyLookupError(message) || "本地词库和 Google 翻译都没有可用结果。")}</p><div>${suggestion}${configAction}</div></div>`;
   }
 
   async function requestDictionary(query, source, signal) {
@@ -264,7 +294,7 @@
     const cached = lookupCache.get(cacheKey);
     if (cached && Date.now() - cached.savedAt < 10 * 60 * 1000) return cached.data;
     const apiBase = window.VocabRuntime?.apiBase ?? "http://127.0.0.1:8081";
-    const timeout = ["ai", "cambridge", "cambridge_zh_en"].includes(source) ? 12000 : 3000;
+    const timeout = dictionaryTimeout(source);
     const combinedSignal = AbortSignal.any([signal, AbortSignal.timeout(timeout)]);
     const response = await fetch(`${apiBase}/api/dictionary/lookup?word=${encodeURIComponent(query)}&source=${encodeURIComponent(source)}`, {signal: combinedSignal});
     const data = await response.json().catch(() => ({}));
@@ -299,6 +329,25 @@
     };
   }
 
+  async function lookupWithAi(query, local, requestId, signal) {
+    const isCurrent = () => requestId === lookupSequence && !signal.aborted;
+    $("#word-detail").innerHTML = `<div class="loading-line">词典没有现成词条，正在用 AI 翻译 “${esc(query)}”…</div>`;
+    try {
+      const data = await requestDictionary(query, "ai", signal);
+      if (!isCurrent()) return true;
+      if (Array.isArray(data?.result?.expressions)) {
+        renderTranslationResult(data.result, "ai");
+        markActivity(query, true);
+        return true;
+      }
+    } catch (error) {
+      if (error?.name === "AbortError" && !isTimeoutError(error)) return true;
+      if (isCurrent()) renderNotFound(query, "smart", local, error.message);
+      return true;
+    }
+    return false;
+  }
+
   async function lookupSmartEnglish(query, local, requestId, signal) {
     const isCurrent = () => requestId === lookupSequence && !signal.aborted;
     try {
@@ -311,78 +360,47 @@
       }
       const remote = data?.result && normalizeRemote({...data.result, source_statuses:data.sources || []}, data.result.source || "smart");
       if (remote && !isDictionaryMatch(remote)) {
+        if (shouldAutoTranslate(query) && await lookupWithAi(query, local, requestId, signal)) return;
         showAlternative(query, remote, data.sources || []);
         return;
       }
       if (remote && hasChineseDictionaryDefinition(remote)) {
         const merged = local ? mergeDictionaryResults([remote, local], data.sources || []) : remote;
         rememberDiscovered(merged);
-        renderWord(merged, "智能判断 · 本机词典优先");
+        renderWord(merged, remote._source === "google" ? "Google 翻译" : "本地词库");
         markActivity(merged.word, true);
-        if (window.VocabAtelierAI?.enrichRemoteWord && !["oxford","ecdict"].includes(remote._source)) window.VocabAtelierAI.enrichRemoteWord(merged).catch(() => {});
         return;
       }
     } catch (error) {
-      if (error?.name === "AbortError") return;
+      if (error?.name === "AbortError" && !isTimeoutError(error)) return;
+      if (isCurrent() && shouldAutoTranslate(query) && await lookupWithAi(query, local, requestId, signal)) return;
       if (isCurrent()) renderNotFound(query, "smart", local, error.message);
       return;
     }
+    if (isCurrent() && shouldAutoTranslate(query) && await lookupWithAi(query, local, requestId, signal)) return;
     if (isCurrent()) renderNotFound(query, "smart", local, "没有找到可用的中文释义。");
   }
 
   async function lookup(word, options = {}) {
-    const query = norm(word);
+    const typed = looseQuery(word);
+    const query = norm(typed);
     if (!query) return;
-    const source = options.source || dictionarySource;
-    if (source !== dictionarySource && !options.preserveSource) setDictionarySource(source);
     lookupController?.abort();
     lookupController = new AbortController();
     const requestId = ++lookupSequence;
-    const isCurrent = () => requestId === lookupSequence && !lookupController.signal.aborted;
     $("#search-input").value = word;
     $("#suggestions").classList.remove("open");
     switchTab("lookup");
     const local = dataset().find(item => norm(item.word) === query);
     const localChinese = local && hasChineseDictionaryDefinition(local) ? local : null;
-    if (source === "smart" && localChinese) renderWord(localChinese, localChinese._discovered ? "个人词库 · 在线词典补充中" : "精选雅思词库 · 在线词典补充中");
-    else $("#word-detail").innerHTML = `<div class="loading-line">正在用 ${esc(DICTIONARY_LABELS[source])} 检索 “${esc(word)}”…</div>`;
+    if (localChinese && !hasChinese(typed)) renderWord(localChinese, localChinese._discovered ? "个人词库 · 在线词典补充中" : "精选雅思词库 · 在线词典补充中");
+    else $("#word-detail").innerHTML = `<div class="loading-line">正在查询 “${esc(typed)}”…</div>`;
     if (proxyOnline) {
-      try {
-        if (source === "smart" && !hasChinese(query)) {
-          await lookupSmartEnglish(query, localChinese, requestId, lookupController.signal);
-          return;
-        }
-        const apiBase = window.VocabRuntime?.apiBase ?? "http://127.0.0.1:8081";
-        const response = await fetch(`${apiBase}/api/dictionary/lookup?word=${encodeURIComponent(query)}&source=${encodeURIComponent(source)}`, { signal: AbortSignal.any([lookupController.signal, AbortSignal.timeout(["smart","ai"].includes(source) ? 40000 : 12000)]) });
-        if (response.ok) {
-          const data = await response.json();
-          if (data?.result && !data.error) {
-            if (!isCurrent()) return;
-            if (Array.isArray(data.result.expressions)) { renderTranslationResult(data.result, data.mode || source); markActivity(query, true); return; }
-            if (!data.result.definition) { renderNotFound(query, source, localChinese); return; }
-            const item = normalizeRemote({...data.result, source_statuses:data.sources || []}, data.result.source || source);
-            if (!isDictionaryMatch(item)) { showAlternative(query, item, data.sources); return; }
-            rememberDiscovered(item); renderWord(item, DICTIONARY_LABELS[source]); markActivity(item.word, true);
-            if (window.VocabAtelierAI?.enrichRemoteWord && item._source !== "ecdict") window.VocabAtelierAI.enrichRemoteWord(item).catch(() => {});
-            return;
-          }
-        }
-        if (!response.ok && isCurrent()) {
-          const failure = await response.json().catch(() => ({}));
-          renderNotFound(query, source, localChinese, failure?.error?.message || ""); return;
-        }
-      } catch (error) { if (!isCurrent() || error?.name === "AbortError") return; proxyOnline = false; updateEngine(false); }
+      await lookupSmartEnglish(typed, localChinese, requestId, lookupController.signal);
+      return;
     }
-    if (!hasChinese(query) && source === "free") {
-      try {
-        const response = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(query)}`);
-        if (!response.ok) throw new Error("not found");
-        const item = freeDictionaryItem(await response.json(), query);
-        if (!item) throw new Error("not found");
-        if (!isCurrent()) return;
-        rememberDiscovered(item); renderWord(item, "Free Dictionary · 英文释义"); markActivity(item.word, true); return;
-      } catch { if (isCurrent()) renderNotFound(query, source, localChinese); }
-    } else if (isCurrent()) renderNotFound(query, source, localChinese);
+    if (localChinese) return;
+    renderNotFound(typed, "smart", localChinese, "本地代理未连接，只能使用已缓存的词条。");
   }
 
   function normalizeRemote(data, source) {
@@ -403,19 +421,18 @@
     const itemSource = item.source || item._source;
     const classificationLabel = { curated: "精选分类", ai: "AI 自动分类", local: "本地规则分类", manual: "手动分类" }[item.classification_source] || (item.auto_classified ? "自动分类" : "");
     const sourceLinks = {
-      cambridge: `<a href="${attr(item.source_url || `https://dictionary.cambridge.org/dictionary/english-chinese-simplified/${encodeURIComponent(norm(item.word).replace(/\s+/g, "-"))}`)}" target="_blank" rel="noopener noreferrer">Cambridge 英中词典 ↗</a>`,
-      free: `<a href="${attr(item.source_url || `https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(norm(item.word))}`)}" target="_blank" rel="noopener noreferrer">Free Dictionary ↗</a>`,
+      google: `<a href="${attr(item.source_url || `https://translate.google.com/?hl=zh-CN&sl=en&tl=zh-CN&op=translate&text=${encodeURIComponent(item.query || item.word)}`)}" target="_blank" rel="noopener noreferrer">Google 翻译 ↗</a>`,
       ecdict: "ECDICT 本地词库",
       oxford: "Oxford 本机英汉词典",
-      noad: "Oxford 本机英英词典",
-      smart: "智能判断 · Oxford / ECDICT / Cambridge 按需"
+      local: "本地词库",
+      smart: "本地词库"
     };
     const sourceLabel = sourceLinks[itemSource] || esc(source);
     const inflection = item.match_kind === "inflection" && item.inflection ? item.inflection : null;
     const inflectionNote = inflection ? `<p class="inflection-note">${esc(inflection.form || item.query || "输入词形")} 是 ${esc(inflection.headword || item.word)} 的${esc(inflection.label || "词形变化")}。</p>` : "";
-    const englishOnlyNotice = ["free","noad"].includes(itemSource) ? `<div class="dictionary-language-notice"><strong>英英释义，非翻译</strong><span>以下内容是英文定义；智能查词不会自动展示它。</span></div>` : "";
+    const englishOnlyNotice = "";
     const highlight = text => esc(text || "").replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
-    const senseNames = {cambridge:"Cambridge",oxford:"Oxford 英汉",ecdict:"ECDICT",noad:"Oxford 英英",free:"Free Dictionary",smart:"智能判断"};
+    const senseNames = {oxford:"Oxford 英汉",ecdict:"ECDICT",google:"Google 翻译",local:"本地词库",smart:"本地词库"};
     const senses = Array.isArray(item.senses) && item.senses.length ? item.senses : [];
     const senseHtml = senses.length ? `<section class="sense-section"><header><small>MEANINGS · 全部义项</small><span>${senses.length} 个义项</span></header><div class="sense-list">${senses.map((sense, index) => {
       const examples = (sense.examples || []).slice(0, 2);
@@ -534,9 +551,8 @@
     if (!searchComposing) scheduleSuggestions(event.target.value);
   });
   $("#search-form").addEventListener("submit", event => { event.preventDefault(); lookup($("#search-input").value); });
-  $("#dictionary-source-switch").addEventListener("click", event => { const button = event.target.closest("[data-dictionary-source]"); if (!button) return; $("#suggestions").classList.remove("open"); setDictionarySource(button.dataset.dictionarySource); if (norm($("#search-input").value)) lookup($("#search-input").value); });
   $("#suggestions").addEventListener("click", event => { const button = event.target.closest("[data-word]"); if (button) lookup(button.dataset.word); });
-  $("#word-detail").addEventListener("click", event => { const wordButton = event.target.closest("[data-word]"); const lookupButton = event.target.closest("[data-lookup-word]"); const sourceButton = event.target.closest("[data-dictionary-source-jump]"); const saveButton = event.target.closest("[data-save]"); const speakButton = event.target.closest("[data-speak]"); const apiButton = event.target.closest("[data-open-api-settings]"); if (wordButton) lookup(wordButton.dataset.word); if (lookupButton) lookup(lookupButton.dataset.lookupWord, {source:"smart"}); if (sourceButton) { const source = sourceButton.dataset.dictionarySourceJump; lookup($("#search-input").value, {source, preserveSource: source === "free" || source === "noad"}); } if (saveButton) toggleSave(saveButton.dataset.save); if (speakButton) speak(speakButton.dataset.speak, speakButton); if (apiButton) { switchTab("settings"); requestAnimationFrame(() => $("#settings-api")?.scrollIntoView({behavior:"smooth"})); } });
+  $("#word-detail").addEventListener("click", event => { const wordButton = event.target.closest("[data-word]"); const lookupButton = event.target.closest("[data-lookup-word]"); const saveButton = event.target.closest("[data-save]"); const speakButton = event.target.closest("[data-speak]"); const apiButton = event.target.closest("[data-open-api-settings]"); if (wordButton) lookup(wordButton.dataset.word); if (lookupButton) lookup(lookupButton.dataset.lookupWord); if (saveButton) toggleSave(saveButton.dataset.save); if (speakButton) speak(speakButton.dataset.speak, speakButton); if (apiButton) { switchTab("settings"); requestAnimationFrame(() => $("#settings-api")?.scrollIntoView({behavior:"smooth"})); } });
   $("#recommended-words").addEventListener("click", event => { const button = event.target.closest("[data-word]"); if (button) lookup(button.dataset.word); });
   ["#topic-filter", "#band-filter"].forEach(selector => $(selector).addEventListener("change", () => {
     if (!window.VocabStudy?.renderLibrary) renderLibrary();
@@ -574,7 +590,7 @@
     }
   };
 
-  setDictionarySource(dictionarySource); populateTopics(); updateStats(); renderQuiz(); renderNotebook();
+  populateTopics(); updateStats(); renderQuiz(); renderNotebook();
   probeProxy();
   const recommendations = shuffle(curated).slice(0, 5); $("#recommended-words").innerHTML = recommendations.map(item => `<button data-word="${attr(item.word)}">${esc(item.word)} · B${esc(item.band)}</button>`).join("");
   renderWord(curated.find(item => item.word === "alleviate") || curated[0], "精选雅思词库");

@@ -1,6 +1,13 @@
 import unittest
+from pathlib import Path
 
-from scripts.build_private_catalog import parse_exchange, parse_oxford_chinese, parse_oxford_noad
+from scripts.build_private_catalog import (
+    OXFORD_SOURCE_MARKER,
+    default_oxford_source_root,
+    parse_exchange,
+    parse_oxford_chinese,
+    parse_oxford_noad,
+)
 
 
 class PrivateCatalogBuilderTests(unittest.TestCase):
@@ -25,6 +32,13 @@ class PrivateCatalogBuilderTests(unittest.TestCase):
         parsed = parse_oxford_noad(xml, "", "")
         self.assertEqual(parsed["senses"][0]["definition"], "a meeting of a deliberative body")
         self.assertEqual(parsed["senses"][0]["source"], "noad")
+
+    def test_default_oxford_source_survives_products_bucket_move(self):
+        root = default_oxford_source_root()
+        expected = Path("/Users/zhangjincheng/Documents/GitHub/antigravity-workspace/output")
+        if (expected / OXFORD_SOURCE_MARKER).is_file():
+            self.assertEqual(root, expected)
+            self.assertTrue((root / OXFORD_SOURCE_MARKER).is_file())
 
     def test_ecdict_exchange_produces_only_safe_morphology_aliases(self):
         aliases = list(parse_exchange("s:comparisons/p:compared/i:comparing/0:comparison", "comparison"))

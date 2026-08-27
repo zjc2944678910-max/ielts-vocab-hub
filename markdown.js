@@ -21,7 +21,50 @@
     }
   }
 
-  function renderInline(value) {
+  const ARROW_FALLBACKS = {
+    "\\rightarrow": "\u2192", "\\to": "\u2192", "\\leftarrow": "\u2190",
+    "\\uparrow": "\u2191", "\\downarrow": "\u2193", "\\leftrightarrow": "\u2194",
+    "\\Rightarrow": "\u21d2", "\\Leftarrow": "\u21d0", "\\Leftrightarrow": "\u21d4",
+  };
+
+  function fallbackMath(value) {
+    let output = String(value || "");
+    Object.entries(ARROW_FALLBACKS).forEach(([latex, symbol]) => { output = output.replaceAll(latex, symbol); });
+    return escapeHtml(output);
+  }
+
+  function renderMath(value, displayMode = false) {
+    const source = String(value || "").trim();
+    const tag = displayMode ? "div" : "span";
+    const className = displayMode ? "math-display" : "math-inline";
+    if (!source) return `<${tag} class="${className} math-error"></${tag}>`;
+    const engine = typeof globalThis !== "undefined" ? globalThis.katex : null;
+    if (!engine?.renderToString) return `<${tag} class="${className} math-error">${fallbackMath(source)}</${tag}>`;
+    try {
+      const html = engine.renderToString(source, {
+        displayMode,
+        throwOnError: false,
+        trust: false,
+        strict: "ignore",
+      });
+      if (/class=["'][^"']*katex-error/.test(html)) throw new Error("invalid math");
+      return `<${tag} class="${className}">${html}</${tag}>`;
+    } catch {
+      return `<${tag} class="${className} math-error">${fallbackMath(source)}</${tag}>`;
+    }
+  }
+
+  function citationMap(options) {
+    const result = new Map();
+    for (const source of options?.citations || []) {
+      const ref = String(source?.ref || "").trim();
+      const noteId = String(source?.note_id || "").trim();
+      if (/^N\d+$/.test(ref) && noteId) result.set(ref, source);
+    }
+    return result;
+  }
+
+  function renderInline(value, options = {}) {
     const tokens = [];
     const keep = html => {
       const token = `MDTOKEN${tokens.length}PLACEHOLDER`;
@@ -35,6 +78,19 @@
       const safeHref = safeHttpUrl(href);
       if (!safeHref) return match;
       return keep(`<a href="${escapeHtml(safeHref)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`);
+    });
+    source = source.replace(/\\\(([^\n]+?)\\\)/g, (_, math) => keep(renderMath(math, false)));
+    source = source.replace(/(^|[^\\$])\$(?!\$)([^$\n]+?)\$(?!\$)/g, (_, prefix, math) => `${prefix}${keep(renderMath(math, false))}`);
+
+    const citations = citationMap(options);
+    source = source.replace(/\[(N\d+(?:\s*,\s*N\d+)*)\]/g, (match, group) => {
+      const valid = group.split(",").map(ref => ref.trim()).filter(ref => citations.has(ref));
+      if (!valid.length) return match;
+      return keep(`<span class="inline-citations">${valid.map(ref => {
+        const citation = citations.get(ref);
+        const title = citation.title ? ` title="${escapeHtml(citation.title)}"` : "";
+        return `<button type="button" class="inline-citation" data-open-note="${escapeHtml(citation.note_id)}"${title}>[${escapeHtml(ref)}]</button>`;
+      }).join("")}</span>`);
     });
 
     let html = escapeHtml(source);
@@ -83,7 +139,7 @@
     };
     const flushParagraph = () => {
       if (!paragraph.length) return;
-      output.push(`<p>${paragraph.map(renderInline).join(preserveSoftBreaks ? "<br>" : " ")}</p>`);
+      output.push(`<p>${paragraph.map(line => renderInline(line, options)).join(preserveSoftBreaks ? "<br>" : " ")}</p>`);
       paragraph = [];
     };
     const flushBlocks = () => { flushParagraph(); closeList(); };
@@ -110,6 +166,27 @@
       }
       if (!line.trim()) { flushBlocks(); continue; }
 
+      const trimmed = line.trim();
+      const mathBlock = trimmed.startsWith("$$") ? {open:"$$", close:"$$"}
+        : trimmed.startsWith("\\[") ? {open:"\\[", close:"\\]"} : null;
+      if (mathBlock) {
+        flushBlocks();
+        let source = trimmed.slice(mathBlock.open.length);
+        let closed = source.includes(mathBlock.close);
+        if (closed) source = source.slice(0, source.indexOf(mathBlock.close));
+        while (!closed && index + 1 < lines.length) {
+          index += 1;
+          const next = lines[index];
+          const closeAt = next.indexOf(mathBlock.close);
+          if (closeAt >= 0) {
+            source += `${source ? "\n" : ""}${next.slice(0, closeAt)}`;
+            closed = true;
+          } else source += `${source ? "\n" : ""}${next}`;
+        }
+        output.push(renderMath(source, true));
+        continue;
+      }
+
       if (line.includes("|") && index + 1 < lines.length && isTableDivider(lines[index + 1])) {
         flushBlocks();
         const headers = splitTableRow(line);
@@ -122,7 +199,7 @@
           index += 1;
         }
         index -= 1;
-        output.push(`<div class="markdown-table-wrap"><table><thead><tr>${headers.map((cell, cellIndex) => `<th class="align-${alignments[cellIndex] || "left"}">${renderInline(cell)}</th>`).join("")}</tr></thead><tbody>${rows.map(row => `<tr>${headers.map((_, cellIndex) => `<td class="align-${alignments[cellIndex] || "left"}">${renderInline(row[cellIndex] || "")}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`);
+        output.push(`<div class="markdown-table-wrap"><table><thead><tr>${headers.map((cell, cellIndex) => `<th class="align-${alignments[cellIndex] || "left"}">${renderInline(cell, options)}</th>`).join("")}</tr></thead><tbody>${rows.map(row => `<tr>${headers.map((_, cellIndex) => `<td class="align-${alignments[cellIndex] || "left"}">${renderInline(row[cellIndex] || "", options)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`);
         continue;
       }
 
@@ -130,7 +207,7 @@
       if (heading) {
         flushBlocks();
         const level = Math.min(4, heading[1].length + 1);
-        output.push(`<h${level}>${renderInline(heading[2])}</h${level}>`);
+        output.push(`<h${level}>${renderInline(heading[2], options)}</h${level}>`);
         continue;
       }
       if (/^\s*(?:---+|___+|\*\*\*+)\s*$/.test(line)) {
@@ -138,7 +215,7 @@
       }
       const quote = line.match(/^\s*>\s?(.*)$/);
       if (quote) {
-        flushBlocks(); output.push(`<blockquote>${renderInline(quote[1])}</blockquote>`); continue;
+        flushBlocks(); output.push(`<blockquote>${renderInline(quote[1], options)}</blockquote>`); continue;
       }
       const unordered = line.match(/^\s*[-+*]\s+(.+)$/);
       const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
@@ -146,7 +223,7 @@
         flushParagraph();
         const nextType = unordered ? "ul" : "ol";
         if (listType !== nextType) { closeList(); listType = nextType; output.push(`<${listType}>`); }
-        output.push(`<li>${renderInline((unordered || ordered)[1])}</li>`);
+        output.push(`<li>${renderInline((unordered || ordered)[1], options)}</li>`);
         continue;
       }
       closeList();

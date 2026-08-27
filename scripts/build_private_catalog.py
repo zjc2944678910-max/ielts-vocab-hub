@@ -23,8 +23,52 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE_OUTPUT = ROOT.parents[1] / "output"
 DEFAULT_OUTPUT = Path.home() / ".local" / "share" / "ielts-vocab-hub" / "catalog-private.db"
+OXFORD_SOURCE_MARKER = Path("oxford_full") / "oxford_chinese_unabridged_136k.db"
+
+
+def github_root() -> Path | None:
+    for parent in ROOT.parents:
+        if parent.name == "GitHub":
+            return parent
+    return None
+
+
+def oxford_source_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    env = os.environ.get("IELTS_VOCAB_OXFORD_SOURCE", "").strip()
+    if env:
+        candidates.append(Path(env).expanduser())
+    github = github_root()
+    if github is not None:
+        candidates.append(github / "antigravity-workspace" / "output")
+        candidates.append(github / "codex-workspace" / "output")
+    # Legacy layouts:
+    # - workspace/projects/<slug> -> workspace/output
+    # - workspace/projects/products/<slug> -> workspace/output
+    for depth in (1, 2):
+        candidates.append(ROOT.parents[depth] / "output")
+    candidates.append(Path.home() / ".local" / "share" / "ielts-vocab-hub" / "oxford-source")
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def default_oxford_source_root() -> Path:
+    fallback = Path.home() / ".local" / "share" / "ielts-vocab-hub" / "oxford-source"
+    candidates = oxford_source_candidates()
+    for candidate in candidates:
+        try:
+            if (candidate / OXFORD_SOURCE_MARKER).is_file():
+                return candidate
+        except OSError:
+            continue
+    return candidates[0] if candidates else fallback
 ECDICT_COMMIT = "bc015ed2e24a7abef49fc6dbbb7fe32c1dadaf8b"
 ECDICT_SHA256 = "1a6947e04785db63613a92e14903cdae7954f7e84860b10e68e5c7cbb3f9c3cf"
 ECDICT_URL = f"https://raw.githubusercontent.com/skywind3000/ECDICT/{ECDICT_COMMIT}/ecdict.csv"
@@ -573,18 +617,19 @@ def build(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-root", type=Path, default=WORKSPACE_OUTPUT)
+    parser.add_argument("--source-root", type=Path, default=None)
     parser.add_argument("--bilingual", type=Path)
     parser.add_argument("--noad", type=Path)
     parser.add_argument("--ecdict", type=Path)
     parser.add_argument("--base-catalog", type=Path, default=ROOT / "data" / "catalog.db")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     args = parser.parse_args()
-    bilingual = args.bilingual or args.source_root / "oxford_full" / "oxford_chinese_unabridged_136k.db"
-    noad = args.noad or args.source_root / "oxford_full" / "oxford_noad_unabridged_111k.db"
+    source_root = args.source_root or default_oxford_source_root()
+    bilingual = args.bilingual or source_root / "oxford_full" / "oxford_chinese_unabridged_136k.db"
+    noad = args.noad or source_root / "oxford_full" / "oxford_noad_unabridged_111k.db"
     ecdict = args.ecdict or download_ecdict()
     manifest = build(
-        bilingual=bilingual, noad=noad, ecdict=ecdict, source_root=args.source_root,
+        bilingual=bilingual, noad=noad, ecdict=ecdict, source_root=source_root,
         base_catalog=args.base_catalog, output=args.output.expanduser(),
     )
     print(json.dumps(manifest, ensure_ascii=False))

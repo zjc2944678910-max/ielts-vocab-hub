@@ -32,7 +32,10 @@ sys.path.insert(0, str(ROOT / "vendor"))
 from fsrs import Card, Rating, ReviewLog, Scheduler  # noqa: E402
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
+GROUP_SIZE = 10
+LEARN_STREAK_NEEDED = 3
+REVIEW_STREAK_NEEDED = 2
 DEFAULT_SETTINGS: dict[str, Any] = {
     "profile_name": "学习者",
     "avatar_version": 0,
@@ -121,12 +124,17 @@ def json_load(value: Any, fallback: Any) -> Any:
 def cancel_active_sessions(conn: sqlite3.Connection) -> None:
     """Cancel generated queues and remove only their never-reviewed cards."""
     sessions = conn.execute("SELECT id,queue_json FROM study_sessions WHERE status='active'").fetchall()
-    queued_card_ids = {
-        task.get("card_id")
-        for session in sessions
-        for task in json_load(session["queue_json"], [])
-        if task.get("card_id")
-    }
+    queued_card_ids: set[str] = set()
+    for session in sessions:
+        queue = json_load(session["queue_json"], [])
+        if isinstance(queue, dict):
+            for item in queue.get("words") or []:
+                if item.get("card_id"):
+                    queued_card_ids.add(item["card_id"])
+        elif isinstance(queue, list):
+            for task in queue:
+                if task.get("card_id"):
+                    queued_card_ids.add(task["card_id"])
     stamp = now_iso()
     conn.execute(
         "UPDATE study_sessions SET status='cancelled',completed_at=?,updated_at=? WHERE status='active'",
@@ -250,6 +258,8 @@ def ensure_schema(conn: sqlite3.Connection, db_path: Path) -> None:
             # Generated queues embed full word payloads.  Rebuild old active
             # queues once so the new difficulty policy takes effect without
             # deleting any cards, attempts, or review history.
+            cancel_active_sessions(conn)
+        if old_version < 8:
             cancel_active_sessions(conn)
         card_columns = {row[1] for row in conn.execute("PRAGMA table_info(study_cards)")}
         if "retrievability" not in card_columns:
@@ -638,13 +648,244 @@ def _active_catalog_clause(catalogs: list[str]) -> tuple[str, list[Any]]:
     return _catalog_membership_clause(catalogs)
 
 
+def _group_size(payload: dict[str, Any]) -> int:
+    if payload.get("limit") is not None:
+        return max(1, min(GROUP_SIZE, int(payload["limit"])))
+    return GROUP_SIZE
+
+
+def _abandon_other_group_session(conn: sqlite3.Connection, keep_mode: str) -> None:
+    other = "review" if keep_mode == "learn" else "learn"
+    stamp = now_iso()
+    conn.execute(
+        "UPDATE study_sessions SET status='abandoned',completed_at=?,updated_at=? WHERE mode=? AND status='active'",
+        (stamp, stamp, other),
+    )
+
+
+def _group_item(conn: sqlite3.Connection, word: dict[str, Any], *, is_new: bool, mode: str, settings: dict[str, Any], card_row: sqlite3.Row | None) -> dict[str, Any]:
+    needed = LEARN_STREAK_NEEDED if mode == "learn" else REVIEW_STREAK_NEEDED
+    return {
+        "normalized": word["normalized"],
+        "card_id": card_row["id"] if card_row else None,
+        "is_new": is_new,
+        "review_kind": "new" if is_new else "due",
+        "word": word,
+        "options": option_definitions(word, settings.get("enabled_catalogs", ["ielts"]), settings.get("filter_basic_words", True)),
+        "streak": 0,
+        "needed": needed,
+        "unfamiliar": False,
+        "meaning_done": False,
+        "seen_count": 0,
+        "review_self_done": False,
+        "instant_know": False,
+        "spell_done": False,
+        "spell_correct": None,
+        "spell_needs_retry": False,
+    }
+
+
+def _collect_due_meaning_items(conn: sqlite3.Connection, settings: dict[str, Any], limit: int) -> list[dict[str, Any]]:
+    paused = set(settings.get("paused_catalogs", []))
+    now = utc_now()
+    scored: list[tuple[datetime, sqlite3.Row]] = []
+    for row in conn.execute("SELECT * FROM study_cards WHERE suspended=0 AND card_type='meaning'"):
+        catalogs = set(json_load(row["source_catalogs_json"], []))
+        if catalogs and catalogs.issubset(paused):
+            continue
+        card = Card.from_json(row["fsrs_json"])
+        if card.due <= now:
+            scored.append((card.due, row))
+    scored.sort(key=lambda item: item[0])
+    items = []
+    for _, row in scored[:limit]:
+        word = get_word(conn, row["normalized"])
+        if not word:
+            continue
+        items.append(_group_item(conn, word, is_new=False, mode="review", settings=settings, card_row=row))
+    return items
+
+
+def _iter_new_word_candidates(conn: sqlite3.Connection, settings: dict[str, Any], catalogs: list[str], topic: str):
+    paused = set(settings.get("paused_catalogs", []))
+    seen_cards = {row["normalized"] for row in conn.execute("SELECT normalized FROM study_cards")}
+    personal_rows = conn.execute("SELECT * FROM words ORDER BY saved DESC, created_at").fetchall()
+    for raw in personal_rows:
+        personal = personal_row(raw)
+        key = personal["normalized"]
+        if key in seen_cards:
+            continue
+        word = get_word(conn, key) or personal
+        if settings.get("filter_basic_words", True) and not word_is_study_ready(word):
+            continue
+        if topic and word.get("topic") != topic and topic not in word.get("related_topics", []):
+            continue
+        catalogs_for_word = set(word.get("catalogs") or [])
+        if catalogs_for_word and catalogs_for_word.issubset(paused):
+            continue
+        yield word
+        seen_cards.add(key)
+    clause, params = _active_catalog_clause(catalogs)
+    if settings.get("filter_basic_words", True):
+        clause += " AND study_tier(normalized,pos,bnc,source_tags_json,is_ielts)<9"
+    topics = settings.get("target_topics", [])
+    order = (
+        f"SELECT * FROM catalog_entries WHERE {clause} ORDER BY is_ielts DESC, CASE WHEN topic IN ({','.join('?' for _ in topics)}) THEN 0 ELSE 1 END, study_tier(normalized,pos,bnc,source_tags_json,is_ielts), CASE WHEN bnc>0 THEN bnc ELSE 999999 END, CASE WHEN frq>0 THEN frq ELSE 999999 END, normalized LIMIT 1200"
+        if topics else
+        f"SELECT * FROM catalog_entries WHERE {clause} ORDER BY is_ielts DESC, study_tier(normalized,pos,bnc,source_tags_json,is_ielts), CASE WHEN bnc>0 THEN bnc ELSE 999999 END, CASE WHEN frq>0 THEN frq ELSE 999999 END, normalized LIMIT 1200"
+    )
+    query_params = (*params, *topics) if topics else params
+    with catalog_connection() as catalog:
+        rows = catalog.execute(order, query_params).fetchall()
+    for raw in rows:
+        base = catalog_row(raw)
+        key = base["normalized"]
+        if key in seen_cards:
+            continue
+        word = merge_word(base, personal_row(conn.execute("SELECT * FROM words WHERE normalized=?", (key,)).fetchone()))
+        if topic and word.get("topic") != topic and topic not in word.get("related_topics", []):
+            continue
+        yield word
+        seen_cards.add(key)
+
+
+def _collect_new_learn_items(conn: sqlite3.Connection, settings: dict[str, Any], catalogs: list[str], topic: str, limit: int) -> list[dict[str, Any]]:
+    local_start = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat()
+    completed_today = conn.execute(
+        "SELECT COUNT(DISTINCT normalized) FROM review_logs WHERE review_kind='new' AND created_at>=?",
+        (local_start,),
+    ).fetchone()[0]
+    remaining = max(0, int(settings["daily_new_limit"]) - completed_today)
+    take = min(limit, remaining)
+    items = []
+    if take <= 0:
+        return items
+    for word in _iter_new_word_candidates(conn, settings, catalogs, topic):
+        items.append(_group_item(conn, word, is_new=True, mode="learn", settings=settings, card_row=None))
+        if len(items) >= take:
+            break
+    return items
+
+
+def _prompt_kind_for(item: dict[str, Any], mode: str, phase: str) -> str:
+    if phase == "spelling":
+        return "spelling"
+    if mode == "review" and not item.get("review_self_done"):
+        return "review_self"
+    if mode == "learn" and item.get("seen_count", 0) == 0:
+        return "meaning_mcq"
+    if mode == "learn":
+        return "know_check"
+    return "meaning_mcq"
+
+
+def _pick_group_item(queue: dict[str, Any], last: str | None) -> dict[str, Any] | None:
+    phase = queue.get("phase") or "meaning"
+    if phase == "spelling":
+        for item in queue["words"]:
+            if not item.get("spell_done"):
+                return item
+        return None
+    pending = [item for item in queue["words"] if not item.get("meaning_done")]
+    if not pending:
+        return None
+    if len(pending) == 1:
+        return pending[0]
+    others = [item for item in pending if item["normalized"] != last] or pending
+    others.sort(key=lambda item: (item.get("streak", 0), item.get("seen_count", 0) == 0, -item.get("seen_count", 0)))
+    lowest = others[0].get("streak", 0)
+    pool = [item for item in others if item.get("streak", 0) == lowest]
+    return random.choice(pool)
+
+
+def _set_current_prompt(queue: dict[str, Any], mode: str, last: str | None = None) -> dict[str, Any] | None:
+    item = _pick_group_item(queue, last if last is not None else queue.get("last_normalized"))
+    if not item:
+        if queue.get("phase") != "spelling" and all(word.get("meaning_done") for word in queue["words"]):
+            queue["phase"] = "spelling"
+            item = _pick_group_item(queue, None)
+        if not item:
+            queue["current"] = None
+            queue["phase"] = "done"
+            return None
+    kind = _prompt_kind_for(item, mode, queue.get("phase") or "meaning")
+    queue["current"] = {"normalized": item["normalized"], "kind": kind}
+    return queue["current"]
+
+
+def _group_progress(queue: dict[str, Any]) -> dict[str, Any]:
+    words = queue.get("words") or []
+    return {
+        "remembered": sum(1 for item in words if item.get("meaning_done")),
+        "total": len(words),
+        "phase": queue.get("phase") or "meaning",
+        "spelling_done": sum(1 for item in words if item.get("spell_done")),
+        "spelling_total": len(words),
+        "unfamiliar": sum(1 for item in words if item.get("unfamiliar")),
+    }
+
+
+def _public_current(queue: dict[str, Any]) -> dict[str, Any] | None:
+    current = queue.get("current")
+    if not current:
+        return None
+    item = next((word for word in queue.get("words") or [] if word["normalized"] == current["normalized"]), None)
+    if not item:
+        return None
+    return {
+        "kind": current["kind"],
+        "normalized": item["normalized"],
+        "word": item["word"],
+        "options": item.get("options") or [],
+        "streak": item.get("streak", 0),
+        "needed": item.get("needed", LEARN_STREAK_NEEDED),
+        "unfamiliar": bool(item.get("unfamiliar")),
+        "seen_count": item.get("seen_count", 0),
+        "spell_needs_retry": bool(item.get("spell_needs_retry")),
+        "card_type": "spelling" if current["kind"] == "spelling" else "meaning",
+        "is_new": bool(item.get("is_new")),
+        "review_kind": item.get("review_kind"),
+    }
+
+
+def _create_group_session(conn: sqlite3.Connection, payload: dict[str, Any], mode: str) -> dict[str, Any]:
+    settings = get_settings(conn)
+    catalogs = [x for x in payload.get("catalogs", settings["enabled_catalogs"]) if x in CATALOG_IDS]
+    topic = str(payload.get("topic") or "")
+    limit = _group_size(payload)
+    _abandon_other_group_session(conn, mode)
+    words = _collect_due_meaning_items(conn, settings, limit) if mode == "review" else _collect_new_learn_items(conn, settings, catalogs, topic, limit)
+    queue = {
+        "engine": "group",
+        "phase": "meaning",
+        "streak_needed": LEARN_STREAK_NEEDED if mode == "learn" else REVIEW_STREAK_NEEDED,
+        "last_normalized": None,
+        "settled": False,
+        "settle_summary": None,
+        "words": words,
+        "current": None,
+    }
+    if words:
+        _set_current_prompt(queue, mode, last="")
+    session_id = str(uuid.uuid4())
+    stamp = now_iso()
+    conn.execute(
+        "INSERT INTO study_sessions VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (session_id, mode, json.dumps(payload, ensure_ascii=False), json.dumps(queue, ensure_ascii=False), 0, "active", len(words), stamp, None, stamp),
+    )
+    conn.commit()
+    return get_session(conn, session_id)
+
+
 def create_session(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
     mode = payload.get("mode", "review")
-    if mode not in {"review", "dictation"}:
+    if mode not in {"learn", "review", "dictation"}:
         raise ValueError("训练类型无效")
     active = conn.execute("SELECT * FROM study_sessions WHERE mode=? AND status='active' ORDER BY updated_at DESC LIMIT 1", (mode,)).fetchone()
     if active:
         return get_session(conn, active["id"])
+    if mode in {"learn", "review"}:
+        return _create_group_session(conn, payload, mode)
     settings = get_settings(conn)
     requested_catalogs = [x for x in payload.get("catalogs", settings["enabled_catalogs"]) if x in CATALOG_IDS]
     requested_topic = str(payload.get("topic") or "")
@@ -782,8 +1023,26 @@ def create_session(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[st
 def session_from_row(row: sqlite3.Row) -> dict[str, Any]:
     item = dict(row)
     item["scope"] = json_load(item.pop("scope_json"), {})
-    item["queue"] = json_load(item.pop("queue_json"), [])
-    item["total"] = len(item["queue"])
+    queue = json_load(item.pop("queue_json"), [])
+    if isinstance(queue, dict) and queue.get("engine") == "group":
+        item["engine"] = "group"
+        item["phase"] = queue.get("phase") or "meaning"
+        item["words"] = queue.get("words") or []
+        item["progress"] = _group_progress(queue)
+        item["current"] = _public_current(queue)
+        item["settled"] = bool(queue.get("settled"))
+        item["settle_summary"] = queue.get("settle_summary")
+        item["streak_needed"] = queue.get("streak_needed", LEARN_STREAK_NEEDED)
+        item["queue"] = []
+        item["total"] = len(item["words"])
+    else:
+        item["engine"] = "linear"
+        item["queue"] = queue if isinstance(queue, list) else []
+        item["total"] = len(item["queue"])
+        item["words"] = []
+        item["phase"] = "linear"
+        index = int(item.get("current_index") or 0)
+        item["current"] = item["queue"][index] if 0 <= index < len(item["queue"]) else None
     return item
 
 
@@ -793,13 +1052,18 @@ def get_session(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] | N
         return None
     item = session_from_row(row)
     rating_names = {1: "Again", 2: "Hard", 3: "Good", 4: "Easy"}
+    words_by_key = {word["normalized"]: word for word in item.get("words") or []}
     item["attempts"] = []
     for attempt in conn.execute("SELECT * FROM study_attempts WHERE session_id=? ORDER BY task_index", (session_id,)):
         data = dict(attempt)
         data["correct"] = bool(data["correct"])
         data["corrected"] = bool(data.get("corrected"))
         data["rating_name"] = rating_names.get(data["rating"], "Again")
-        if 0 <= data["task_index"] < len(item["queue"]):
+        if item.get("engine") == "group":
+            word_item = words_by_key.get(data["normalized"])
+            if word_item:
+                data["task"] = {"word": word_item["word"], "card_type": data["card_type"]}
+        elif 0 <= data["task_index"] < len(item["queue"]):
             data["task"] = item["queue"][data["task_index"]]
         item["attempts"].append(data)
     return item
@@ -821,7 +1085,202 @@ def levenshtein(left: str, right: str) -> int:
     return previous[-1]
 
 
+def _settle_rating(item: dict[str, Any], mode: str) -> Rating:
+    if item.get("spell_correct") is False:
+        return Rating.Again
+    if not item.get("unfamiliar"):
+        if mode == "review" and item.get("instant_know"):
+            return Rating.Easy
+        return Rating.Good
+    return Rating.Hard
+
+
+def _settle_group(conn: sqlite3.Connection, mode: str, queue: dict[str, Any]) -> dict[str, Any]:
+    settings = get_settings(conn)
+    scheduler = scheduler_for(settings)
+    dues = []
+    stamp = now_iso()
+    for item in queue["words"]:
+        word = item["word"]
+        rating = _settle_rating(item, mode)
+        card_row = ensure_card(conn, word, "meaning")
+        card = Card.from_json(card_row["fsrs_json"])
+        card, _ = scheduler.review_card(card, rating, review_datetime=utc_now())
+        retrievability = card_retrievability(card, scheduler)
+        conn.execute(
+            "UPDATE study_cards SET fsrs_json=?,calibration=0,retrievability=?,last_rating=?,updated_at=? WHERE id=?",
+            (card.to_json(), retrievability, rating.value, stamp, card_row["id"]),
+        )
+        review_kind = "new" if item.get("is_new") else "due"
+        conn.execute(
+            "INSERT INTO review_logs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                str(uuid.uuid4()), card_row["id"], word["normalized"], "meaning", rating.value,
+                int(not item.get("unfamiliar")), "", 0, "[]", 0, 0, review_kind, stamp,
+            ),
+        )
+        item["card_id"] = card_row["id"]
+        item["due"] = card.due.isoformat()
+        dues.append({
+            "word": word["word"],
+            "due": item["due"],
+            "rating": rating.name,
+            "unfamiliar": bool(item.get("unfamiliar")),
+        })
+    queue["settled"] = True
+    queue["settle_summary"] = {
+        "remembered": sum(1 for item in queue["words"] if not item.get("unfamiliar")),
+        "unfamiliar": sum(1 for item in queue["words"] if item.get("unfamiliar")),
+        "dues": dues,
+    }
+    return queue
+
+
+def _mark_meaning_result(item: dict[str, Any], correct: bool) -> None:
+    item["seen_count"] = int(item.get("seen_count") or 0) + 1
+    if correct:
+        item["streak"] = int(item.get("streak") or 0) + 1
+        if item["streak"] >= int(item.get("needed") or LEARN_STREAK_NEEDED):
+            item["meaning_done"] = True
+    else:
+        item["streak"] = 0
+        item["unfamiliar"] = True
+
+
+def _record_group_attempt(conn: sqlite3.Connection, row: sqlite3.Row, queue: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    if row["status"] != "active":
+        raise ValueError("训练会话已结束")
+    current = queue.get("current")
+    if not current:
+        raise ValueError("训练题目不存在")
+    item = next((word for word in queue["words"] if word["normalized"] == current["normalized"]), None)
+    if not item:
+        raise ValueError("训练题目不存在")
+    word = item["word"]
+    kind = current["kind"]
+    answer = str(payload.get("answer", "")).strip()
+    timeout = bool(payload.get("timeout"))
+    hints = [str(x) for x in payload.get("hints", [])]
+    duration = max(0, min(3_600_000, int(payload.get("duration_ms", 0))))
+    replays = max(0, min(100, int(payload.get("replays", 0))))
+    close = False
+    show_detail = False
+    expected = word.get("definition")
+    card_type = "meaning"
+
+    if kind == "review_self":
+        item["review_self_done"] = True
+        if answer == "know" and not timeout:
+            item["streak"] = int(item.get("needed") or REVIEW_STREAK_NEEDED)
+            item["meaning_done"] = True
+            item["instant_know"] = True
+            item["seen_count"] = int(item.get("seen_count") or 0) + 1
+            correct = True
+            show_detail = False
+        elif answer == "fuzzy" and not timeout:
+            item["unfamiliar"] = True
+            item["seen_count"] = int(item.get("seen_count") or 0) + 1
+            correct = False
+            show_detail = True
+        else:
+            item["unfamiliar"] = True
+            item["streak"] = 0
+            item["seen_count"] = int(item.get("seen_count") or 0) + 1
+            correct = False
+            show_detail = True
+    elif kind == "know_check":
+        correct = answer == "know" and not timeout
+        _mark_meaning_result(item, correct)
+        show_detail = not correct
+    elif kind == "meaning_mcq":
+        correct = answer == str(word.get("definition", "")).strip()
+        _mark_meaning_result(item, correct)
+        show_detail = True
+    elif kind == "spelling":
+        card_type = "spelling"
+        expected = word["word"]
+        actual = spelling_normalize(answer)
+        target = spelling_normalize(word["word"])
+        correct = actual == target
+        close_limit = 1 if len(target) <= 7 else 2
+        close = not correct and levenshtein(actual, target) <= close_limit
+        if correct:
+            item["spell_done"] = True
+            item["spell_correct"] = True
+            item["spell_needs_retry"] = False
+        else:
+            item["unfamiliar"] = True
+            item["spell_correct"] = False
+            item["spell_needs_retry"] = True
+        show_detail = not correct
+    else:
+        raise ValueError("训练题目不存在")
+
+    verdict = "remembered" if item.get("meaning_done") and not item.get("unfamiliar") else ("unfamiliar" if not correct or item.get("unfamiliar") else "progress")
+    rating = Rating.Good if correct else Rating.Again
+    stamp = now_iso()
+    attempt_index = int(row["current_index"] or 0)
+    conn.execute(
+        """INSERT INTO study_attempts (
+          id,session_id,task_index,normalized,card_type,answer,correct,rating,
+          duration_ms,hints_json,replays,corrected,created_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (str(uuid.uuid4()), row["id"], attempt_index, word["normalized"], card_type, answer, int(correct), rating.value, duration, json.dumps(hints), replays, int(correct), stamp),
+    )
+    last = item["normalized"]
+    if kind == "spelling" and not correct:
+        queue["current"] = {"normalized": item["normalized"], "kind": "spelling"}
+        queue["last_normalized"] = last
+    else:
+        queue["last_normalized"] = last
+        _set_current_prompt(queue, row["mode"], last=last)
+    status = "active"
+    if queue.get("phase") == "done" and not queue.get("settled"):
+        _settle_group(conn, row["mode"], queue)
+        status = "complete"
+        queue["phase"] = "done"
+        queue["current"] = None
+    conn.execute(
+        "UPDATE study_sessions SET queue_json=?,current_index=?,status=?,completed_at=CASE WHEN ?='complete' THEN ? ELSE completed_at END,updated_at=? WHERE id=?",
+        (json.dumps(queue, ensure_ascii=False), attempt_index + 1, status, status, stamp, stamp, row["id"]),
+    )
+    conn.commit()
+    public = get_session(conn, row["id"])
+    due = None
+    if queue.get("settled") and item.get("due"):
+        due = item["due"]
+    return {
+        "correct": correct,
+        "close": close,
+        "rating": verdict,
+        "expected": expected,
+        "show_detail": show_detail,
+        "timeout": timeout,
+        "scheduled": bool(queue.get("settled")),
+        "due": due,
+        "duration_ms": duration,
+        "replays": replays,
+        "current_index": attempt_index + 1,
+        "status": status,
+        "streak": item.get("streak", 0),
+        "needed": item.get("needed"),
+        "meaning_done": bool(item.get("meaning_done")),
+        "unfamiliar": bool(item.get("unfamiliar")),
+        "word": word,
+        "current": public.get("current") if public else None,
+        "progress": public.get("progress") if public else _group_progress(queue),
+        "settle_summary": queue.get("settle_summary"),
+        "phase": queue.get("phase"),
+    }
+
+
 def record_attempt(conn: sqlite3.Connection, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    row = conn.execute("SELECT * FROM study_sessions WHERE id=?", (session_id,)).fetchone()
+    if not row:
+        raise KeyError("训练会话不存在")
+    queue = json_load(row["queue_json"], [])
+    if isinstance(queue, dict) and queue.get("engine") == "group":
+        return _record_group_attempt(conn, row, queue, payload)
     session = get_session(conn, session_id)
     if not session:
         raise KeyError("训练会话不存在")

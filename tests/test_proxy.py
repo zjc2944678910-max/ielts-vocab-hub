@@ -215,8 +215,72 @@ class CambridgeParserTests(unittest.TestCase):
         """
         item = parse_cambridge_chinese(page, "简化", "https://example.test/简化")
         self.assertEqual(item["direction"], "zh-en")
+        self.assertEqual(item["heading_match"], "exact")
         self.assertEqual([entry["expression"] for entry in item["expressions"]], ["simplification", "streamline"])
         self.assertEqual(item["expressions"][0]["examples"][0]["cn"], "这是一种简化。")
+
+    def test_chinese_phrase_falls_back_to_core_heading(self):
+        page = """
+        <h2 class="tw-bw dhw dpos-h_hw di-title" lang="zh-Hans">缓解</h2>
+        <span class="trans dtranszh lmr-10 hdib" lang="en"><a><span class="dtrans">alleviate</span></a></span>
+        <span class="pos dpos-zh lmr-10 hdib">verb</span><div class="def">to make a problem less severe</div>
+        <span class="trans dtranszh lmr-10 hdib" lang="en"><span class="dtrans">ease</span></span>
+        <span class="pos dpos-zh lmr-10 hdib">verb</span><div class="def">to make less unpleasant</div>
+        <h2 class="tw-bw dhw dpos-h_hw di-title" lang="zh-Hans">缓解剂</h2>
+        <span class="trans dtranszh lmr-10 hdib" lang="en"><span class="dtrans">mitigant</span></span>
+        """
+        item = parse_cambridge_chinese(page, "缓解压力", "https://example.test/缓解?q=缓解压力")
+        self.assertEqual(item["heading_match"], "related")
+        self.assertEqual(item["matched_heading"], "缓解")
+        self.assertEqual([entry["expression"] for entry in item["expressions"]], ["alleviate", "ease"])
+
+    def test_phrasal_verb_title_counts_as_exact_match(self):
+        page = """
+        <div class="pv-block"><div class="di-title"><h2 class="headword tw-bw dhw dpos-h_hw "><b>look <span class="obj dobj">something</span> up</b></h2></div>
+        <span class="pos dpos">phrasal verb</span> with <span class="hw dhw">look</span>
+        <span class="pos dpos">verb</span>
+        <div class="def ddef_d db">to try to find information</div>
+        <div class="def-body ddef_b"><span class="trans dtrans dtrans-se break-cj" lang="zh-Hans">查阅</span></div>
+        </div>
+        """
+        item = parse_cambridge(page, "look up")
+        self.assertTrue(item["exact"])
+        self.assertEqual(item["match_kind"], "phrase")
+        self.assertEqual(item["word"], "look up")
+        self.assertEqual(item["definition"], "查阅")
+
+    def test_leading_article_is_stripped_from_idiom_lookup(self):
+        self.assertEqual(proxy.strip_english_article("a double-edged sword"), "double-edged sword")
+        self.assertEqual(proxy.english_lookup_forms("a double-edged sword")[0], "double-edged sword")
+        self.assertIn("double-edged-sword", proxy.cambridge_slugs("a double-edged sword"))
+        self.assertTrue(proxy.lookup_equivalent("a double-edged sword", "double-edged sword"))
+        page = """
+        <span class="hw dhw">double-edged sword</span><span class="pos dpos">noun</span>
+        <div class="def ddef_d db">something that has advantages and disadvantages</div>
+        <div class="def-body ddef_b"><span class="trans dtrans dtrans-se break-cj" lang="zh-Hans">双刃剑</span></div>
+        """
+        item = parse_cambridge(page, "a double-edged sword")
+        self.assertTrue(item["exact"])
+        self.assertEqual(item["definition"], "双刃剑")
+        self.assertEqual(item["match_kind"], "phrase")
+
+    @patch("proxy.read_config", return_value={"configured": "yes"})
+    @patch("proxy.google_translate_lookup", side_effect=proxy.ApiFailure("translate_unavailable", "down", 502))
+    @patch("proxy.fetch_local_dictionary", side_effect=proxy.ApiFailure("word_not_found", "none", 404))
+    @patch("proxy.fetch_oxford_dictionary", side_effect=proxy.ApiFailure("word_not_found", "none", 404))
+    @patch("proxy.ai_translate_lookup", return_value={"query": "a double-edged sword", "direction": "en-zh", "source": "ai", "expressions": [{"expression": "a double-edged sword", "translation_cn": "双刃剑"}]})
+    def test_smart_phrase_falls_back_to_ai_when_dictionaries_miss(self, ai_lookup, _oxford, _local, _google, _config):
+        result = dictionary_lookup("a double-edged sword", "smart")
+        self.assertEqual(result["mode"], "ai")
+        self.assertEqual(result["fallback_from"], "google")
+        ai_lookup.assert_called_once_with("a double-edged sword")
+
+    def test_chinese_phrase_suggestions_prefer_matching_ielts_words(self):
+        self.assertEqual(proxy.chinese_query_tokens("缓解压力"), ["缓解压力", "缓解", "压力"])
+        suggestions = proxy.dictionary_suggestions("缓解压力", 8)
+        words = [item["word"] for item in suggestions]
+        self.assertIn("alleviate", words)
+        self.assertLess(words.index("alleviate"), 3)
 
     @patch("proxy.call_ai_json", return_value={"expressions": [{
         "expression": "alleviate pressure", "translation_cn": "缓解压力",
@@ -238,22 +302,51 @@ class CambridgeParserTests(unittest.TestCase):
         self.assertEqual(item["direction"], "en-zh")
         self.assertEqual(item["expressions"][0]["translation_cn"], "承受主要冲击")
 
-    @patch("proxy.read_config", return_value={"configured": "yes"})
-    @patch("proxy.fetch_cambridge_chinese", side_effect=ApiFailure("word_not_found", "none", 404))
-    @patch("proxy.ai_translate_lookup", return_value={"query": "缓解压力", "direction": "zh-en", "source": "ai", "expressions": [{"expression": "alleviate pressure"}]})
-    def test_smart_chinese_falls_back_to_ai(self, ai_lookup, _cambridge, _config):
-        result = dictionary_lookup("缓解压力", "smart")
-        self.assertEqual(result["mode"], "ai")
-        self.assertEqual(result["fallback_from"], "cambridge_zh_en")
-        ai_lookup.assert_called_once_with("缓解压力")
+    @patch("proxy.call_ai_json", return_value={"expression": "a double-edged sword", "translation_cn": "一把双刃剑"})
+    def test_ai_translation_heals_flat_object(self, _call):
+        item = ai_translate_lookup("a double-edged sword")
+        self.assertEqual(item["expressions"][0]["translation_cn"], "一把双刃剑")
+        self.assertEqual(item["expressions"][0]["expression"], "a double-edged sword")
 
     @patch("proxy.read_config", return_value={"configured": "yes"})
-    @patch("proxy.ai_translate_lookup", return_value={"query": "这是一个完整句子。", "direction": "zh-en", "source": "ai", "expressions": [{"expression": "This is a complete sentence."}]})
-    def test_smart_chinese_sentence_uses_ai_directly(self, ai_lookup, _config):
-        result = dictionary_lookup("这是一个完整句子。", "smart")
+    @patch("proxy.google_translate_lookup", side_effect=ApiFailure("translate_unavailable", "down", 502))
+    @patch("proxy.ai_translate_lookup", return_value={"query": "缓解压力", "direction": "zh-en", "source": "ai", "expressions": [{"expression": "alleviate pressure"}]})
+    def test_smart_chinese_falls_back_to_ai(self, ai_lookup, _google, _config):
+        result = dictionary_lookup("缓解压力", "smart")
         self.assertEqual(result["mode"], "ai")
-        self.assertEqual(result["detected"], "chinese_sentence")
-        ai_lookup.assert_called_once()
+        self.assertEqual(result["fallback_from"], "google")
+        ai_lookup.assert_called_once_with("缓解压力")
+
+    @patch("proxy.ai_translate_lookup")
+    @patch("proxy.google_translate_lookup", return_value={"query": "这是一个完整句子。", "direction": "zh-en", "source": "google", "expressions": [{"expression": "This is a complete sentence."}]})
+    def test_smart_chinese_sentence_uses_google_before_ai(self, google_lookup, ai_lookup):
+        result = dictionary_lookup("这是一个完整句子。", "smart")
+        self.assertEqual(result["mode"], "google")
+        google_lookup.assert_called_once()
+        ai_lookup.assert_not_called()
+
+    def test_google_translate_parser_reads_sentence_and_alternatives(self):
+        payload = [
+            [["双刃剑", "a double-edged sword", None, None, 3]],
+            [["noun", [["双面刃", "double-edged sword", 0], ["双刃剑", "a double-edged sword", 0]]]],
+            "en",
+        ]
+        self.assertEqual(proxy._google_translated_text(payload), "双刃剑")
+        self.assertEqual(proxy._google_alternatives(payload, "双刃剑"), ["双面刃"])
+        self.assertEqual(proxy._google_translated_text(["一把双刃剑"]), "一把双刃剑")
+
+    @patch("proxy.urllib.request.urlopen")
+    def test_google_translate_uses_chrome_endpoint(self, urlopen):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def read(self): return b'["\xe4\xb8\x80\xe6\x8a\x8a\xe5\x8f\x8c\xe5\x88\x83\xe5\x89\x91"]'
+        urlopen.return_value = Response()
+        item = proxy.google_translate_lookup("a double-edged sword")
+        self.assertEqual(item["source"], "google")
+        self.assertEqual(item["definition"], "一把双刃剑")
+        self.assertIn("clients5.google.com/translate_a/t", urlopen.call_args.args[0].full_url)
+        self.assertIn("dict-chrome-ex", urlopen.call_args.args[0].full_url)
 
     def test_nested_markup_keeps_complete_translation_and_examples(self):
         page = """
@@ -348,41 +441,23 @@ class CambridgeParserTests(unittest.TestCase):
         self.assertEqual(item["word"], "plant pot")
         self.assertEqual(item["senses"], senses)
 
-    @patch("proxy.fetch_free_dictionary", side_effect=ApiFailure("word_not_found", "none", 404))
     @patch("proxy.fetch_local_dictionary", side_effect=ApiFailure("word_not_found", "none", 404))
     @patch("proxy.fetch_oxford_dictionary", side_effect=ApiFailure("word_not_found", "none", 404))
-    @patch("proxy.fetch_cambridge")
-    def test_smart_lookup_marks_redirect_as_alternative(self, cambridge, _oxford, _local, free):
-        cambridge.return_value = {"word": "pot plant", "headword": "pot plant", "query": "plant pot", "exact": False, "definition": "室内盆栽植物", "senses": []}
-        result = dictionary_lookup("plant pot", "smart")
-        self.assertTrue(result["alternative"])
-        self.assertFalse(result["result"]["exact"])
-        free.assert_not_called()
-
-    @patch("proxy.fetch_free_dictionary")
-    @patch("proxy.fetch_local_dictionary", side_effect=ApiFailure("word_not_found", "none", 404))
-    @patch("proxy.fetch_oxford_dictionary", side_effect=ApiFailure("word_not_found", "none", 404))
-    @patch("proxy.fetch_cambridge")
-    def test_smart_lookup_accepts_cambridge_inflection_without_free_fallback(self, cambridge, _oxford, _local, free):
-        cambridge.return_value = {
-            "word": "comparison", "headword": "comparison", "query": "comparisons",
-            "exact": False, "match_kind": "inflection",
-            "inflection": {"form": "comparisons", "headword": "comparison", "label": "复数"},
-            "definition": "比较，对照，对比",
-            "senses": [{"pos": "noun", "definition": "比较，对照，对比", "source": "cambridge"}],
+    @patch("proxy.google_translate_lookup")
+    def test_smart_lookup_uses_google_when_local_misses(self, google, _oxford, _local):
+        google.return_value = {
+            "query": "plant pot", "word": "plant pot", "headword": "plant pot", "exact": True,
+            "definition": "花盆", "senses": [{"definition": "花盆", "source": "google"}], "source": "google",
         }
-        result = dictionary_lookup("comparisons", "smart")
-        self.assertFalse(result.get("alternative", False))
-        self.assertEqual(result["result"]["word"], "comparison")
-        self.assertEqual(result["result"]["match_kind"], "inflection")
-        self.assertEqual(result["result"]["definition"], "比较，对照，对比")
-        self.assertEqual([status["id"] for status in result["sources"]], ["oxford", "ecdict", "cambridge"])
-        free.assert_not_called()
+        result = dictionary_lookup("plant pot", "smart")
+        self.assertEqual(result["mode"], "google")
+        self.assertEqual(result["result"]["definition"], "花盆")
+        google.assert_called_once()
 
-    @patch("proxy.fetch_cambridge")
+    @patch("proxy.google_translate_lookup")
     @patch("proxy.fetch_local_dictionary")
     @patch("proxy.fetch_oxford_dictionary")
-    def test_smart_lookup_stops_before_cambridge_when_oxford_has_chinese(self, oxford, ecdict, cambridge):
+    def test_smart_lookup_stops_before_google_when_oxford_has_chinese(self, oxford, ecdict, google):
         oxford.return_value = {
             "word": "comparison", "headword": "comparison", "query": "comparisons",
             "exact": False, "match_kind": "inflection",
@@ -395,25 +470,7 @@ class CambridgeParserTests(unittest.TestCase):
         self.assertEqual(result["result"]["word"], "comparison")
         self.assertEqual(result["result"]["match_kind"], "inflection")
         self.assertEqual(result["sources"][0]["id"], "oxford")
-        cambridge.assert_not_called()
-
-    @patch("proxy.fetch_noad_dictionary")
-    @patch("proxy.fetch_free_dictionary")
-    @patch("proxy.fetch_local_dictionary", side_effect=ApiFailure("word_not_found", "none", 404))
-    @patch("proxy.fetch_oxford_dictionary", side_effect=ApiFailure("word_not_found", "none", 404))
-    @patch("proxy.fetch_cambridge")
-    def test_smart_lookup_does_not_return_english_only_or_request_free(self, cambridge, _oxford, _local, free, noad):
-        cambridge.return_value = {
-            "word": "example", "headword": "example", "query": "example", "exact": True,
-            "definition": "a representative form or pattern",
-            "senses": [{"pos": "noun", "definition": "a representative form or pattern", "source": "cambridge"}],
-        }
-        with self.assertRaises(ApiFailure) as failure:
-            dictionary_lookup("example", "smart")
-        self.assertEqual(failure.exception.status, 404)
-        self.assertIn("中文义项", failure.exception.message)
-        free.assert_not_called()
-        noad.assert_not_called()
+        google.assert_not_called()
 
     def test_dictionary_suggestions_use_local_prefix_index(self):
         suggestions = proxy.dictionary_suggestions("al", 8)

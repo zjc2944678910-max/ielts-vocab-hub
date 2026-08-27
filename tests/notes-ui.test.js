@@ -10,7 +10,8 @@ const root = path.resolve(__dirname, "..");
 const staticFiles = new Set([
   "/index.html", "/styles.css", "/runtime-config.js", "/startup-redirect.js",
   "/dict.js", "/speech.js", "/app.js", "/markdown.js", "/ai-app.js",
-  "/notes-app.js", "/study-app.js", "/data/ielts-catalog.js",
+  "/notes-app.js", "/study-app.js", "/speaking-app.js", "/data/ielts-catalog.js",
+  "/vendor/katex/katex.min.css", "/vendor/katex/katex.min.js",
   "/assets/graphic-eq-round.svg",
 ]);
 const stamp = "2026-08-14T08:00:00+00:00";

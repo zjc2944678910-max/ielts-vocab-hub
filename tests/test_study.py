@@ -63,12 +63,12 @@ class StudySystemTests(unittest.TestCase):
         basic = study.get_word(self.conn, "system")
         card = study.ensure_card(self.conn, basic, "meaning")
         self.conn.commit()
-        session = study.create_session(self.conn, {"mode": "review", "catalogs": ["cet4"]})
-        due_ids = [task["card_id"] for task in session["queue"] if not task["is_new"]]
-        new_words = [task["word"]["normalized"] for task in session["queue"] if task["is_new"]]
-        self.assertIn(card["id"], due_ids)
-        self.assertNotIn("system", new_words)
-        self.assertTrue(all(task["word"].get("study_eligible", True) for task in session["queue"] if task["is_new"]))
+        review = study.create_session(self.conn, {"mode": "review", "catalogs": ["cet4"]})
+        self.assertEqual(review["engine"], "group")
+        self.assertIn(card["id"], [item["card_id"] for item in review["words"]])
+        learn = study.create_session(self.conn, {"mode": "learn", "catalogs": ["cet4"]})
+        self.assertNotIn("system", [item["word"]["normalized"] for item in learn["words"]])
+        self.assertTrue(all(item["word"].get("study_eligible", True) for item in learn["words"]))
 
     def test_related_topic_filter_returns_word_once(self):
         with study.catalog_connection() as catalog:
@@ -78,20 +78,71 @@ class StudySystemTests(unittest.TestCase):
         keys = [word["normalized"] for word in page["words"]]
         self.assertEqual(len(keys), len(set(keys)))
 
-    def test_meaning_and_spelling_cards_schedule_independently(self):
+    def _due(self, card_id):
+        return study.Card.from_json(self.conn.execute("SELECT fsrs_json FROM study_cards WHERE id=?", (card_id,)).fetchone()[0]).due
+
+    def test_group_attempts_do_not_schedule_until_settle(self):
         word = study.get_word(self.conn, "objective")
         meaning = study.ensure_card(self.conn, word, "meaning")
         spelling = study.ensure_card(self.conn, word, "spelling")
         self.conn.commit()
-        session = study.create_session(self.conn, {"mode": "review", "catalogs": ["ielts"]})
-        meaning_index = next(i for i, task in enumerate(session["queue"]) if task["card_id"] == meaning["id"])
-        task = session["queue"][meaning_index]
-        before = study.Card.from_json(self.conn.execute("SELECT fsrs_json FROM study_cards WHERE id=?", (spelling["id"],)).fetchone()[0]).due
-        session["current_index"] = meaning_index
-        self.conn.execute("UPDATE study_sessions SET current_index=? WHERE id=?", (meaning_index, session["id"]))
-        study.record_attempt(self.conn, session["id"], {"task_index": meaning_index, "answer": task["word"]["definition"], "recall_mode": "recall"})
-        after = study.Card.from_json(self.conn.execute("SELECT fsrs_json FROM study_cards WHERE id=?", (spelling["id"],)).fetchone()[0]).due
-        self.assertEqual(before, after)
+        before_meaning = self._due(meaning["id"])
+        before_spelling = self._due(spelling["id"])
+        session = study.create_session(self.conn, {"mode": "review", "catalogs": ["ielts"], "limit": 1})
+        self.assertEqual(session["current"]["kind"], "review_self")
+        study.record_attempt(self.conn, session["id"], {"answer": "know"})
+        self.assertEqual(self._due(meaning["id"]), before_meaning)
+        self.assertEqual(self._due(spelling["id"]), before_spelling)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM review_logs").fetchone()[0], 0)
+        settled = study.record_attempt(self.conn, session["id"], {"answer": "objective"})
+        self.assertEqual(settled["status"], "complete")
+        self.assertGreater(self._due(meaning["id"]), before_meaning)
+        self.assertEqual(self._due(spelling["id"]), before_spelling)
+
+    def test_learn_wrong_resets_streak_and_returns_word(self):
+        session = study.create_session(self.conn, {"mode": "learn", "catalogs": ["ielts"], "limit": 1})
+        word = session["words"][0]["word"]
+        self.assertEqual(session["current"]["kind"], "meaning_mcq")
+        study.record_attempt(self.conn, session["id"], {"answer": "definitely wrong"})
+        mid = study.get_session(self.conn, session["id"])
+        item = mid["words"][0]
+        self.assertEqual(item["streak"], 0)
+        self.assertTrue(item["unfamiliar"])
+        self.assertEqual(mid["current"]["normalized"], word["normalized"])
+        self.assertEqual(mid["current"]["kind"], "know_check")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM review_logs").fetchone()[0], 0)
+        for _ in range(3):
+            current = study.get_session(self.conn, session["id"])["current"]
+            answer = "know" if current["kind"] == "know_check" else word["definition"]
+            study.record_attempt(self.conn, session["id"], {"answer": answer})
+        done = study.get_session(self.conn, session["id"])
+        self.assertTrue(done["words"][0]["meaning_done"])
+        self.assertEqual(done["phase"], "spelling")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM review_logs").fetchone()[0], 0)
+
+    def test_learn_group_excludes_due_words_and_caps_size(self):
+        word = study.get_word(self.conn, "objective")
+        study.ensure_card(self.conn, word, "meaning")
+        self.conn.commit()
+        study.update_settings(self.conn, {"enabled_catalogs": ["ielts"], "daily_new_limit": 20})
+        session = study.create_session(self.conn, {"mode": "learn", "catalogs": ["ielts"]})
+        keys = [item["word"]["normalized"] for item in session["words"]]
+        self.assertNotIn("objective", keys)
+        self.assertLessEqual(len(session["words"]), 10)
+        self.assertTrue(all(item["is_new"] for item in session["words"]))
+        self.assertEqual(session["current"]["kind"], "meaning_mcq")
+
+    def test_learn_three_consecutive_correct_marks_remembered(self):
+        session = study.create_session(self.conn, {"mode": "learn", "catalogs": ["ielts"], "limit": 1})
+        word = session["words"][0]["word"]
+        study.record_attempt(self.conn, session["id"], {"answer": word["definition"]})
+        study.record_attempt(self.conn, session["id"], {"answer": "know"})
+        study.record_attempt(self.conn, session["id"], {"answer": "know"})
+        done = study.get_session(self.conn, session["id"])
+        self.assertTrue(done["words"][0]["meaning_done"])
+        self.assertFalse(done["words"][0]["unfamiliar"])
+        self.assertEqual(done["phase"], "spelling")
+        self.assertEqual(done["current"]["kind"], "spelling")
 
     def test_free_dictation_does_not_create_card_until_wrong(self):
         session = study.create_session(self.conn, {"mode": "dictation", "catalogs": ["cet4"], "limit": 1})

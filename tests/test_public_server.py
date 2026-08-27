@@ -1,3 +1,4 @@
+import inspect
 import os
 import unittest
 from unittest.mock import patch
@@ -15,9 +16,16 @@ class PublicGatewayTests(unittest.TestCase):
 
     def test_static_allowlist_blocks_private_project_files(self):
         self.assertIn("/index.html", public_server.STATIC_FILES)
+        self.assertIn("/speaking-app.js", public_server.STATIC_FILES)
         self.assertNotIn("/proxy.py", public_server.STATIC_FILES)
         self.assertNotIn("/start-public.sh", public_server.STATIC_FILES)
         self.assertNotIn("/data/catalog.db", public_server.STATIC_FILES)
+
+    def test_public_pages_allow_same_origin_microphone(self):
+        source = inspect.getsource(public_server.PublicGateway.security_headers)
+        self.assertIn("microphone=(self)", source)
+        self.assertIn("camera=()", source)
+        self.assertIn("geolocation=()", source)
 
     def test_authenticated_email_and_cookie_visitors_are_stable_and_distinct(self):
         handler = object.__new__(public_server.PublicGateway)

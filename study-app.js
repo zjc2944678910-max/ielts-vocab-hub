@@ -5,7 +5,7 @@
   const state = {
     settings: null, catalogs: [], dashboard: null, session: null,
     introduced: new Set(), phase: "prompt", recallMode: "options",
-    hints: [], replays: 0, startedAt: 0, results: [], libraryCursor: null,
+    hints: [], replays: 0, startedAt: 0, timerTimeout: null, submitting: false, results: [], libraryCursor: null,
     libraryWords: [], libraryTimer: null,
     profileDraft: {avatar: null, background: null},
     crop: null,
@@ -201,33 +201,69 @@
     $("#streak-days").textContent = `${state.dashboard.streak || 0} 天`;
   }
 
-  async function renderReview() {
-    try { await refreshCore(); }
-    catch (err) { error("#review-home", err.message); return; }
-    const d = state.dashboard;
-    if (!state.session && d.active_sessions?.review) await restoreSession(d.active_sessions.review);
-    $("#review-summary").innerHTML = `<span><b>${d.due_total}</b> 到期</span><span><b>${d.new_words_today}/${d.new_limit}</b> 新词</span>`;
-    if (state.session?.mode === "review" && state.session.status === "active") return renderCurrentTask();
-    $("#review-session").classList.add("hidden");
-    $("#review-home").classList.remove("hidden");
-    $("#review-home").innerHTML = `<div class="study-hero"><p class="eyebrow">TODAY'S QUEUE</p><h2>${d.due_total ? `有 ${d.due_total} 张卡需要巩固` : "到期卡已经清空"}</h2><p>词义到期 ${d.due.meaning} · 拼写到期 ${d.due.spelling}。完成后再按唯一单词加入最多 ${Math.max(0, d.new_limit - d.new_words_today)} 个新词。</p><button class="primary" data-start-review>${d.due_total ? "开始今日复习" : "学习今日新词"}</button></div><div class="study-rules"><div><b>词义识别</b><span>主动回忆优先，选项只是辅助</span></div><div><b>拼写产出</b><span>严格拼写，提示后答对记为 Hard</span></div><div><b>遗忘曲线</b><span>FSRS 6.3.1 独立安排两类记忆</span></div></div>`;
+  function hideStudyExtras() {
+    $("#study-paraphrase")?.classList.add("hidden");
+    $("#study-dictation")?.classList.add("hidden");
+    $("#study-home")?.classList.remove("hidden");
   }
 
+  function clearKnowTimer() {
+    if (state.timerTimeout) { clearTimeout(state.timerTimeout); state.timerTimeout = null; }
+  }
+
+  async function renderStudy() {
+    try { await refreshCore(); }
+    catch (err) { error("#study-home", err.message); return; }
+    const d = state.dashboard;
+    if (!state.session) {
+      const active = d.active_sessions || {};
+      const id = active.learn || active.review;
+      if (id) await restoreSession(id);
+    }
+    if (state.session?.status === "active" && state.session.mode !== "dictation") return renderCurrentTask();
+    hideStudyExtras();
+    $("#study-session").classList.add("hidden");
+    const books = (state.catalogs || []).filter(catalog => (state.settings.enabled_catalogs || []).includes(catalog.id));
+    const bookNames = books.map(catalog => catalog.name).join(" · ") || "还没选词书";
+    const remainingNew = Math.max(0, d.new_limit - d.new_words_today);
+    const reviewCount = d.due?.meaning || 0;
+    const learnCount = Math.min(10, remainingNew);
+    const reviewGroup = Math.min(10, reviewCount);
+    $("#study-summary").innerHTML = `<span><b>${reviewCount}</b> 待复习</span><span><b>${d.new_words_today}/${d.new_limit}</b> 新词</span>`;
+    $("#study-home").innerHTML = `<div class="study-hero"><p class="eyebrow">TODAY · ${esc(bookNames)}</p><h2>${reviewCount || remainingNew ? (reviewCount ? `先复习 ${reviewCount} 个到期词` : `今天还可以新学 ${remainingNew} 个`) : "今日学习已完成"}</h2><p>看英文能不能立刻想起意思。选错、点不认识或来不及，都算不熟，会马上再考。连续答对 3 次才算这组记住，一组认完再拼写。</p><div class="study-today-metrics"><div><b>${reviewCount}</b><span>待复习</span></div><div><b>${remainingNew}</b><span>待学新词</span></div><div><b>${d.due?.spelling || 0}</b><span>自由听写可练</span></div></div><div class="study-actions"><button class="primary" data-start-review ${reviewCount ? "" : "disabled"}>${reviewCount ? `先复习 ${reviewGroup} 个` : "暂无到期复习"}</button><button class="${reviewCount ? "secondary" : "primary"}" data-start-learn ${remainingNew ? "" : "disabled"}>${remainingNew ? `学新词 ${learnCount} 个` : "今日新词已满"}</button></div></div><div class="study-rules"><div><b>1. 检查</b><span>先闭卷看英选中。对错当时判定，不靠事后给自己打分。</span></div><div><b>2. 记住 / 不熟</b><span>连续答对才记住；选错、模糊或超时就是不熟，计数归零并留在本组。</span></div><div><b>3. 拼写</b><span>一组词都记住后才拼。复习日期在本组结束后才排。</span></div></div><div class="study-extras"><button class="secondary" type="button" data-open-paraphrase>同义替换加练</button><button class="quiet-button" type="button" data-open-dictation>自由听写</button></div>`;
+  }
+
+  function renderReview() { return renderStudy(); }
+
+  function openParaphrase() {
+    $("#study-home").classList.add("hidden");
+    $("#study-session").classList.add("hidden");
+    $("#study-dictation")?.classList.add("hidden");
+    $("#study-paraphrase").classList.remove("hidden");
+    window.VocabAtelier && (location.hash === "#paraphrase" || history.replaceState(null, "", "#paraphrase"));
+  }
+
+  function openDictation() { return renderDictation(); }
+
   async function startSession(mode, extra = {}) {
-    const target = mode === "review" ? "#review-home" : "#dictation-home";
-    $(target).innerHTML = `<div class="loading-line">正在生成个性化训练队列…</div>`;
+    hideStudyExtras();
+    const target = "#study-home";
+    $(target).innerHTML = `<div class="loading-line">正在生成今日学习队列…</div>`;
     try {
       const data = await api("/api/study/sessions", {method:"POST", body:JSON.stringify({mode, catalogs:state.settings.enabled_catalogs, ...extra})});
       state.session = data.session; state.introduced.clear(); hydrateResults();
       if (!state.session.total) {
-        $(target).innerHTML = `<div class="empty-state">当前范围没有可训练的词。可以在个人设置中启用更多词库。</div>`;
+        $(target).innerHTML = `<div class="empty-state">当前词书没有可学的词。去设置里先选词书，再定每天新学几个。</div>`;
         return;
       }
       renderCurrentTask();
     } catch (err) { error(target, err.message); }
   }
 
-  function currentTask() { return state.session?.queue?.[state.session.current_index]; }
+  function currentTask() {
+    if (state.session?.engine === "group") return state.session.current;
+    return state.session?.queue?.[state.session.current_index];
+  }
 
   function hydrateResults() {
     state.results = (state.session?.attempts || []).map(attempt => ({
@@ -242,8 +278,25 @@
   }
 
   function taskHeader(task) {
+    if (state.session?.engine === "group") {
+      const progress = state.session.progress || {};
+      const total = Math.max(1, progress.total || state.session.total || 1);
+      const spelling = progress.phase === "spelling";
+      const count = spelling ? `${progress.spelling_done || 0} / ${progress.spelling_total || total}` : `${progress.remembered || 0} / ${total}`;
+      const value = spelling
+        ? Math.round((progress.spelling_done || 0) / Math.max(1, progress.spelling_total || total) * 100)
+        : Math.round((progress.remembered || 0) / total * 100);
+      const phase = spelling ? "拼写" : (state.session.mode === "review" ? "复习" : "学新词");
+      return `<div class="session-progress"><span>${count} 已记住</span><progress max="100" value="${Math.max(0, Math.min(100, value))}"></progress><em>${phase}${task?.unfamiliar ? " · 不熟" : ""}</em></div>`;
+    }
     const index = state.session.current_index + 1;
     return `<div class="session-progress"><span>${index} / ${state.session.total}</span><progress max="100" value="${Math.max(0,Math.min(100,Math.round(index / state.session.total * 100)))}"></progress><em>${task.card_type === "meaning" ? "词义" : "拼写"}${task.review_kind === "free" ? " · 自由练习" : task.is_new ? " · 新词" : " · 到期"}</em></div>`;
+  }
+
+  function streakLights(task) {
+    const needed = Number(task?.needed || 3);
+    const streak = Number(task?.streak || 0);
+    return `<div class="streak-lights" aria-label="连续答对 ${streak}/${needed}">${Array.from({length: needed}, (_, index) => `<span class="${index < streak ? "on" : "off"}">●</span>`).join("")}</div>`;
   }
 
   function introHtml(task) {
@@ -258,8 +311,20 @@
     return `${taskHeader(task)}<article class="study-card recall-card"><p class="eyebrow">先不要看释义</p><h2>${esc(word.word)}</h2><p class="phonetic-line">${esc(word.pos || "词汇")} · ${esc(word.phonetic || "")}</p>${context ? `<blockquote>${esc(context.replace(/\*\*/g,""))}</blockquote>` : ""}<div class="recall-actions"><button class="primary" data-recall="recall">想起来了</button><button class="secondary" data-recall="options">需要选项</button><button class="text-button" data-skip>跳过</button></div></article>`;
   }
 
+  function playWordButton(word, extra = "") {
+    return `<button class="audio-button audio-button-compact" type="button" data-replay-word="${attr(word)}" aria-label="播放 ${attr(word)} 发音"${extra}><img src="assets/graphic-eq-round.svg" alt="" aria-hidden="true"></button>`;
+  }
+
   function meaningOptions(task) {
-    return `${taskHeader(task)}<article class="study-card option-card"><p class="eyebrow">选择 ${esc(task.word.word)} 的核心词义</p><div class="meaning-options">${task.options.map(option => `<button data-meaning-answer="${attr(option)}">${esc(option)}</button>`).join("")}</div>${state.recallMode === "recall" ? `<label class="easy-check"><input type="checkbox" id="meaning-easy">我能立即、准确地想起（太简单）</label>` : ""}</article>`;
+    const lights = state.session?.engine === "group" ? streakLights(task) : "";
+    const word = task.word;
+    return `${taskHeader(task)}${lights}<article class="study-card option-card"><p class="eyebrow">看英选中</p><div class="study-word-head"><h2>${esc(word.word)}</h2>${playWordButton(word.word)}<p class="phonetic-line">${esc(word.pos || "词汇")} · ${esc(word.phonetic || "")}</p></div><div class="meaning-options">${(task.options || []).map(option => `<button data-meaning-answer="${attr(option)}">${esc(option)}</button>`).join("")}</div></article>`;
+  }
+
+  function knowCheck(task, withFuzzy) {
+    const seconds = withFuzzy ? 3 : 4;
+    const word = task.word;
+    return `${taskHeader(task)}${streakLights(task)}<article class="study-card recall-card"><p class="eyebrow">${withFuzzy ? "3 秒内判断熟不熟" : "还认识这个词吗"}</p><div class="study-word-head study-word-head-center"><h2>${esc(word.word)}</h2>${playWordButton(word.word)}<p class="phonetic-line">${esc(word.pos || "词汇")} · ${esc(word.phonetic || "")}</p></div><div class="know-timer" style="--know-seconds:${seconds}s"><span></span></div><div class="recall-actions"><button class="primary" data-know-answer="know">认识</button>${withFuzzy ? `<button class="secondary" data-know-answer="fuzzy">模糊</button>` : ""}<button class="text-button" data-know-answer="unknown">不认识</button></div></article>`;
   }
 
   function spellingPrompt(task) {
@@ -270,53 +335,95 @@
 
   function renderCurrentTask() {
     const task = currentTask();
-    const mode = state.session?.mode;
-    const home = mode === "review" ? $("#review-home") : $("#dictation-home");
-    const box = mode === "review" ? $("#review-session") : $("#dictation-session");
-    if (!task) return renderResults();
+    const home = $("#study-home");
+    const box = $("#study-session");
+    clearKnowTimer();
+    if (!task || state.session?.status === "complete") return renderResults();
+    hideStudyExtras();
     home.classList.add("hidden"); box.classList.remove("hidden");
     state.phase = "prompt"; state.recallMode = "options"; state.hints = []; state.replays = 0; state.startedAt = performance.now();
+    if (state.session?.engine === "group") {
+      if (task.kind === "meaning_mcq") { box.innerHTML = meaningOptions(task); if (state.settings.autoplay) setTimeout(() => speak(task.word.word, box.querySelector("[data-replay-word]")), 80); }
+      else if (task.kind === "know_check") { box.innerHTML = knowCheck(task, false); startKnowTimer(4); if (state.settings.autoplay) setTimeout(() => speak(task.word.word, box.querySelector("[data-replay-word]")), 80); }
+      else if (task.kind === "review_self") { box.innerHTML = knowCheck(task, true); startKnowTimer(3); if (state.settings.autoplay) setTimeout(() => speak(task.word.word, box.querySelector("[data-replay-word]")), 80); }
+      else { box.innerHTML = spellingPrompt(task); if (state.settings.autoplay) setTimeout(() => speak(task.word.word), 120); }
+      return;
+    }
     if (task.is_new && !state.introduced.has(task.word.normalized)) box.innerHTML = introHtml(task);
-    else if (task.card_type === "meaning") box.innerHTML = meaningPrompt(task);
+    else if (task.card_type === "meaning") box.innerHTML = meaningOptions(task);
     else { box.innerHTML = spellingPrompt(task); if (state.settings.autoplay) setTimeout(() => speak(task.word.word), 120); }
-    if (mode === "dictation") $("#dictation-score").textContent = `${state.results.filter(x=>x.correct).length} / ${state.results.length}`;
+  }
+
+  function startKnowTimer(seconds) {
+    clearKnowTimer();
+    state.timerTimeout = setTimeout(() => {
+      state.timerTimeout = null;
+      submitAttempt("unknown", {timeout: true});
+    }, seconds * 1000);
   }
 
   function beginTest() {
     const task = currentTask(); state.introduced.add(task.word.normalized);
-    const box = state.session.mode === "review" ? $("#review-session") : $("#dictation-session");
+    const box = $("#study-session");
     state.startedAt = performance.now();
-    box.innerHTML = task.card_type === "meaning" ? meaningPrompt(task) : spellingPrompt(task);
+    box.innerHTML = task.card_type === "meaning" ? meaningOptions(task) : spellingPrompt(task);
     if (task.card_type === "spelling" && state.settings.autoplay) setTimeout(() => speak(task.word.word), 120);
   }
 
   function showMeaningOptions(mode) {
     state.recallMode = mode;
-    const box = state.session.mode === "review" ? $("#review-session") : $("#dictation-session");
+    const box = $("#study-session");
     box.innerHTML = meaningOptions(currentTask());
   }
 
   async function submitAttempt(answer, extra = {}) {
-    const task = currentTask(); if (!task) return;
-    const box = state.session.mode === "review" ? $("#review-session") : $("#dictation-session");
+    const task = currentTask(); if (!task || state.submitting) return;
+    const box = $("#study-session");
+    state.submitting = true;
+    clearKnowTimer();
     box.querySelectorAll("button,input").forEach(el => el.disabled = true);
     try {
-      const data = await api(`/api/study/sessions/${state.session.id}/attempts`, {method:"POST", body:JSON.stringify({task_index:state.session.current_index, answer, recall_mode:state.recallMode, hints:state.hints, replays:state.replays, duration_ms:Math.round(performance.now()-state.startedAt), ...extra})});
+      const payload = {task_index:state.session.current_index, answer, recall_mode:state.recallMode, hints:state.hints, replays:state.replays, duration_ms:Math.round(performance.now()-state.startedAt), ...extra};
+      const data = await api(`/api/study/sessions/${state.session.id}/attempts`, {method:"POST", body:JSON.stringify(payload)});
       const result = data.result; state.results.push({...result, task}); state.session.current_index = result.current_index; state.session.status = result.status;
+      if (state.session.engine === "group") {
+        state.session.current = result.current;
+        state.session.progress = result.progress;
+        state.session.phase = result.phase;
+        if (result.settle_summary) state.session.settle_summary = result.settle_summary;
+        const remembered = result.meaning_done && !result.unfamiliar;
+        const label = remembered ? "记住了" : (result.correct && result.meaning_done ? "这组记住了，但中途不熟" : (result.correct ? "对了，还要再连对" : "不熟"));
+        const nextCopy = result.status === "complete" ? "查看结果" : (task.kind === "spelling" && !result.correct ? "再拼一次" : "继续");
+        const detail = result.show_detail || !result.correct;
+        box.innerHTML = `${taskHeader(result.current || task)}${streakLights({streak:result.streak, needed:result.needed})}<article class="study-card result-card ${result.correct ? "correct" : "wrong"}"><p class="eyebrow">${result.timeout ? "来不及，算不熟" : (result.correct ? "回答正确" : "这次没答对")}</p><div class="study-word-head"><h2>${esc(task.word.word)}</h2>${playWordButton(task.word.word)}<p class="phonetic-line">${esc(task.word.pos || "词汇")} · ${esc(task.word.phonetic || "")}</p></div>${detail ? `<p>${esc(task.word.definition)}</p>` : ""}<div class="rating-result"><b>${esc(label)}</b><span>${result.scheduled && result.due ? `下次复习：${new Date(result.due).toLocaleString("zh-CN", {month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"})}` : (result.meaning_done ? "还在本组，先拼写" : "还在本组循环")}</span></div><button class="primary" data-next-task>${nextCopy}</button></article>`;
+        return;
+      }
       const label = result.rating === "Again" ? "需要重学" : result.rating === "Hard" ? "有提示，稍难" : result.rating === "Easy" ? "太简单" : "主动答对";
       box.innerHTML = `${taskHeader(task)}<article class="study-card result-card ${result.correct ? "correct" : "wrong"}"><p class="eyebrow">${result.correct ? "回答正确" : result.close ? "很接近，但仍算错误" : "这次没答对"}</p><h2>${esc(task.word.word)}</h2><p>${esc(task.word.definition)}</p><div class="rating-result"><b>${esc(label)}</b><span>${result.scheduled && result.due ? `下次：${new Date(result.due).toLocaleString("zh-CN", {month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"})}` : "自由练习未推迟正式复习"}</span></div>${!result.correct&&task.card_type==="spelling"?`<div class="correction-box"><label>请再输入一次正确拼写<input id="correction-input" autocomplete="off"></label><button class="secondary" data-correct-attempt>确认纠正</button><span id="correction-status"></span></div>`:""}<button class="primary" data-next-task ${!result.correct&&task.card_type==="spelling"?"disabled":""}>${result.status === "complete" ? "查看结果" : "下一题"}</button></article>`;
     } catch (err) { window.VocabAtelier?.toast(err.message); box.querySelectorAll("button,input").forEach(el => el.disabled = false); }
+    finally { state.submitting = false; }
   }
 
   function renderResults() {
     const mode = state.session.mode;
-    const box = mode === "review" ? $("#review-session") : $("#dictation-session");
+    const box = $("#study-session");
+    clearKnowTimer();
+    if (state.session.engine === "group") {
+      const summary = state.session.settle_summary || {};
+      const dues = summary.dues || [];
+      const remembered = summary.remembered ?? dues.filter(item => !item.unfamiliar).length;
+      const unfamiliar = summary.unfamiliar ?? dues.filter(item => item.unfamiliar).length;
+      const weak = dues.filter(item => item.unfamiliar);
+      box.innerHTML = `<article class="study-results"><p class="eyebrow">GROUP COMPLETE</p><h2>${mode === "review" ? "这组复习完成了" : "这组新词学完了"}</h2><div class="result-metrics"><div><b>${remembered}</b><span>记住</span></div><div><b>${unfamiliar}</b><span>不熟</span></div><div><b>${state.session.total || 0}</b><span>本组词数</span></div><div><b>${dues.length ? new Date(dues[0].due).toLocaleDateString("zh-CN", {month:"numeric",day:"numeric"}) : "—"}</b><span>下次复习</span></div></div>${weak.length ? `<div class="wrong-words"><small>本组不熟</small>${weak.map(item=>`<button data-lookup-word="${attr(item.word)}">${esc(item.word)}</button>`).join("")}</div>` : `<p class="success-copy">这组都记住了，间隔会拉长一些。</p>`}<button class="primary" data-finish-session>回到今日学习</button></article>`;
+      refreshCore({force:true}).catch(()=>{});
+      return;
+    }
     const total = state.results.length, correct = state.results.filter(x=>x.correct).length;
     const corrected = state.results.filter(x=>x.correct || x.corrected).length;
     const avgDuration = total ? state.results.reduce((sum,x)=>sum+(x.duration_ms||0),0)/total : 0;
     const replayCount = state.results.reduce((sum,x)=>sum+(x.replays||0),0);
     const wrong = state.results.filter(x=>!x.correct);
-    box.innerHTML = `<article class="study-results"><p class="eyebrow">SESSION COMPLETE</p><h2>${mode === "review" ? "今日这一轮完成了" : "听写训练完成"}</h2><div class="result-metrics"><div><b>${total ? Math.round(correct/total*100) : 0}%</b><span>首次正确率</span></div><div><b>${total ? Math.round(corrected/total*100) : 0}%</b><span>最终纠正率</span></div><div><b>${avgDuration ? (avgDuration/1000).toFixed(1)+"s" : "—"}</b><span>平均耗时</span></div><div><b>${replayCount}</b><span>重播次数</span></div></div>${wrong.length ? `<div class="wrong-words"><small>本轮错词</small>${wrong.map(x=>`<button data-lookup-word="${attr(x.task.word.word)}">${esc(x.task.word.word)}</button>`).join("")}</div>${mode==="dictation"?`<button class="secondary" data-retry-wrong>只练错词</button>`:""}` : `<p class="success-copy">全部答对，做得很好。</p>`}<button class="primary" data-finish-session>完成</button></article>`;
+    box.innerHTML = `<article class="study-results"><p class="eyebrow">SESSION COMPLETE</p><h2>${mode === "review" ? "这一轮学习完成了" : "听写加练完成"}</h2><div class="result-metrics"><div><b>${total ? Math.round(correct/total*100) : 0}%</b><span>首次正确率</span></div><div><b>${total ? Math.round(corrected/total*100) : 0}%</b><span>最终纠正率</span></div><div><b>${avgDuration ? (avgDuration/1000).toFixed(1)+"s" : "—"}</b><span>平均耗时</span></div><div><b>${replayCount}</b><span>重播次数</span></div></div>${wrong.length ? `<div class="wrong-words"><small>本轮错词</small>${wrong.map(x=>`<button data-lookup-word="${attr(x.task.word.word)}">${esc(x.task.word.word)}</button>`).join("")}</div>${mode==="dictation"?`<button class="secondary" data-retry-wrong>只练错词</button>`:""}` : `<p class="success-copy">全部答对，做得很好。</p>`}<button class="primary" data-finish-session>回到今日学习</button></article>`;
     refreshCore({force:true}).catch(()=>{});
   }
 
@@ -348,11 +455,14 @@
   }
 
   async function renderDictation() {
-    try { await refreshCore(); } catch (err) { error("#dictation-home", err.message); return; }
+    try { await refreshCore(); } catch (err) { error("#study-dictation", err.message); return; }
     if (!state.session && state.dashboard.active_sessions?.dictation) await restoreSession(state.dashboard.active_sessions.dictation);
     if (state.session?.mode === "dictation" && state.session.status === "active") return renderCurrentTask();
-    $("#dictation-session").classList.add("hidden"); $("#dictation-home").classList.remove("hidden");
-    $("#dictation-home").innerHTML = `<div class="dictation-builder"><p class="eyebrow">BUILD A SET</p><h2>选择这次要练的范围</h2><div class="scope-picks"><label><input type="checkbox" name="dict-scope" value="due" checked>到期拼写</label><label><input type="checkbox" name="dict-scope" value="mistakes" checked>历史错词</label><label><input type="checkbox" name="dict-scope" value="saved">生词本</label><label><input type="checkbox" name="dict-scope" value="personal">个人词库</label><label><input type="checkbox" name="dict-scope" value="catalogs" checked>所选内置词库</label></div><div class="catalog-picks">${state.catalogs.map(c=>`<label><input type="checkbox" name="dict-catalog" value="${attr(c.id)}" ${state.settings.enabled_catalogs.includes(c.id)?"checked":""}><b>${esc(c.name)}</b><span>${c.count.toLocaleString()} 词</span></label>`).join("")}</div><div class="form-grid"><label>话题<select id="dictation-topic"><option value="">全部话题</option>${[...new Set((window.VocabAtelier?.getDataset?.()||[]).map(x=>x.topic).filter(Boolean))].sort().map(x=>`<option>${esc(x)}</option>`).join("")}</select></label><label>题量<select id="dictation-limit">${[10,20,30,50].map(n=>`<option ${n===state.settings.dictation_count?"selected":""}>${n}</option>`).join("")}</select></label></div><p>系统会优先放入到期拼写卡；其余题目为自由练习，不会提前改变正式复习日。${state.settings.filter_basic_words ? "基础词过滤已开启。" : "当前包含完整基础词。"}</p><button class="primary" data-start-dictation>开始听写</button></div>`;
+    $("#study-home").classList.add("hidden");
+    $("#study-session").classList.add("hidden");
+    $("#study-paraphrase")?.classList.add("hidden");
+    $("#study-dictation").classList.remove("hidden");
+    $("#study-dictation").innerHTML = `<div class="dictation-builder"><header class="study-extra-head"><p class="eyebrow">FREE SPELLING</p><button class="text-button" data-close-extra type="button">返回今日学习</button></header><h2>自由听写</h2><p>主线学习里已经包含到期拼写。这里只是额外加练，不会提前改正式复习日。</p><div class="scope-picks"><label><input type="checkbox" name="dict-scope" value="due" checked>到期拼写</label><label><input type="checkbox" name="dict-scope" value="mistakes" checked>历史错词</label><label><input type="checkbox" name="dict-scope" value="saved">生词本</label><label><input type="checkbox" name="dict-scope" value="personal">个人词库</label><label><input type="checkbox" name="dict-scope" value="catalogs" checked>所选词书</label></div><div class="catalog-picks">${state.catalogs.map(c=>`<label><input type="checkbox" name="dict-catalog" value="${attr(c.id)}" ${state.settings.enabled_catalogs.includes(c.id)?"checked":""}><b>${esc(c.name)}</b><span>${c.count.toLocaleString()} 词</span></label>`).join("")}</div><div class="form-grid"><label>话题<select id="dictation-topic"><option value="">全部话题</option>${[...new Set((window.VocabAtelier?.getDataset?.()||[]).map(x=>x.topic).filter(Boolean))].sort().map(x=>`<option>${esc(x)}</option>`).join("")}</select></label><label>题量<select id="dictation-limit">${[10,20,30,50].map(n=>`<option ${n===state.settings.dictation_count?"selected":""}>${n}</option>`).join("")}</select></label></div><button class="primary" data-start-dictation>开始听写</button></div>`;
   }
 
   function renderSettingsSync() {
@@ -481,17 +591,23 @@
   function bind() {
     document.addEventListener("click", event => {
       if (event.target.closest("[data-start-review]")) startSession("review");
+      if (event.target.closest("[data-start-learn]")) startSession("learn");
+      const know=event.target.closest("[data-know-answer]"); if(know) submitAttempt(know.dataset.knowAnswer);
+      if (event.target.closest("[data-open-paraphrase]")) openParaphrase();
+      if (event.target.closest("[data-open-dictation]")) openDictation();
+      if (event.target.closest("[data-close-extra]")) { hideStudyExtras(); history.replaceState(null, "", "#study"); renderStudy(); }
       if (event.target.closest("[data-start-dictation]")) { const catalogs=[...document.querySelectorAll('[name="dict-catalog"]:checked')].map(x=>x.value);const scopes=[...document.querySelectorAll('[name="dict-scope"]:checked')].map(x=>x.value); startSession("dictation",{catalogs,scopes,topic:$("#dictation-topic").value,limit:Number($("#dictation-limit").value)}); }
       if (event.target.closest("[data-begin-test]")) beginTest();
       const recall=event.target.closest("[data-recall]"); if(recall) showMeaningOptions(recall.dataset.recall);
       const meaning=event.target.closest("[data-meaning-answer]"); if(meaning) submitAttempt(meaning.dataset.meaningAnswer,{easy:$("#meaning-easy")?.checked||false});
-      const replay=event.target.closest("[data-replay]"); if(replay){state.replays++;speak(currentTask().word.word,replay);replay.querySelector("span").textContent=`播放 · ${state.replays+1}`;}
+      const replayWord=event.target.closest("[data-replay-word]"); if(replayWord){state.replays++;speak(replayWord.dataset.replayWord,replayWord);return;}
+      const replay=event.target.closest("[data-replay]"); if(replay){const task=currentTask(); if(!task) return; state.replays++;speak(task.word.word,replay);const label=replay.querySelector("span"); if(label) label.textContent=`播放 · ${state.replays+1}`;}
       const hint=event.target.closest("[data-hint]"); if(hint&&!state.hints.includes(hint.dataset.hint)){state.hints.push(hint.dataset.hint);const word=currentTask().word.word;$("#spelling-hint").textContent=state.hints.map(x=>x==="first"?`首字母 ${word[0]}`:`${word.length} 个字符`).join(" · ");}
       if(event.target.closest("[data-skip]")) submitAttempt("",{recall_mode:"skip"});
       if(event.target.closest("[data-next-task]")) renderCurrentTask();
       if(event.target.closest("[data-correct-attempt]")){const input=$("#correction-input");api(`/api/study/sessions/${state.session.id}/attempts`,{method:"POST",body:JSON.stringify({task_index:state.session.current_index-1,answer:input.value,correction:true})}).then(({result})=>{if(result.corrected){state.results[state.results.length-1].corrected=true;$("#correction-status").textContent="已纠正";event.target.disabled=true;$("[data-next-task]").disabled=false;}else $("#correction-status").textContent="还不完全正确";}).catch(err=>window.VocabAtelier?.toast(err.message));}
       if(event.target.closest("[data-retry-wrong]")){const words=state.results.filter(x=>!x.correct).map(x=>x.task.word.word);state.session=null;startSession("dictation",{scopes:[],catalogs:[],words,limit:words.length});}
-      if(event.target.closest("[data-finish-session]")){state.session=null;state.results=[];location.hash==="#dictation"?renderDictation():renderReview();}
+      if(event.target.closest("[data-finish-session]")){state.session=null;state.results=[];renderStudy();}
       const lookup=event.target.closest("[data-lookup-word]");if(lookup)window.VocabAtelier?.lookup(lookup.dataset.lookupWord);
       if(event.target.closest("[data-load-library]"))renderRemoteLibrary(false);
       const clear=event.target.closest("[data-clear-scope]");if(clear)clearScope(clear.dataset.clearScope);
@@ -525,7 +641,7 @@
     $("#library-search").addEventListener("input",()=>{clearTimeout(state.libraryTimer);state.libraryTimer=setTimeout(()=>renderRemoteLibrary(true,{force:true}),220);});
   }
 
-  window.VocabStudy={renderReview,renderDictation,renderSettings,renderLibrary:(force=false)=>renderRemoteLibrary(true,{force}),refresh:refreshCore};
+  window.VocabStudy={renderStudy,renderReview:renderStudy,renderDictation,openParaphrase,openDictation,renderSettings,renderLibrary:(force=false)=>renderRemoteLibrary(true,{force}),refresh:refreshCore};
   bind();
-  refreshCore().then(()=>{renderSettingsSync();renderRemoteLibrary(true);if(location.hash==="#flashcards")renderReview();if(location.hash==="#dictation")renderDictation();}).catch(()=>{});
+  refreshCore().then(()=>{renderSettingsSync();renderRemoteLibrary(true);if(["#study","#flashcards","#dictation","#paraphrase"].includes(location.hash))renderStudy();if(location.hash==="#dictation")openDictation();if(location.hash==="#paraphrase")openParaphrase();}).catch(()=>{});
 })();

@@ -619,6 +619,7 @@
     document.querySelectorAll("[data-note-ai]").forEach(button => button.disabled = true);
     $("#note-save-status").textContent = `AI 正在${labels[operation]}…`;
     let draftId = "";
+    let routeMeta = {};
     try {
       const response = await fetch(`${API}/api/notes/${note.id}/ai-drafts`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({operation, instruction})});
       if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(data.error?.message || "AI 草稿生成失败"); }
@@ -630,14 +631,15 @@
           const name = block.split("\n").find(line => line.startsWith("event:"))?.slice(6).trim();
           const raw = block.split("\n").find(line => line.startsWith("data:"))?.slice(5).trim(); if (!raw) continue;
           const data = JSON.parse(raw);
-          if (name === "start" || name === "meta") draftId = data.draft_id || draftId;
+          if (name === "start" || name === "meta") { draftId = data.draft_id || draftId; routeMeta = data.routing || routeMeta; }
+          if (name === "route") routeMeta = data.routing || routeMeta;
           if (name === "delta") draftText += data.text || "";
-          if (name === "done") { draftId = data.draft_id || draftId; draftText = data.content_md || draftText; }
+          if (name === "done") { draftId = data.draft_id || draftId; draftText = data.content_md || draftText; routeMeta = data.routing || routeMeta; }
           if (name === "error") throw new Error(data.message || "AI 草稿生成失败");
         }
       }
       if (!draftId || !draftText.trim()) throw new Error("模型没有生成可用的笔记正文，请重试或在设置中更换模型");
-      await showDraftDiff(note, draftId, draftText, labels[operation]);
+      await showDraftDiff(note, draftId, draftText, labels[operation], routeMeta);
     } catch (error) {
       if (draftId) await api(`/api/note-ai-drafts/${draftId}`, {method:"DELETE"}).catch(() => {});
       toast(error.message);
@@ -648,8 +650,10 @@
     }
   }
 
-  async function showDraftDiff(note, draftId, content, label) {
-    const result = await openDialog({title:`AI ${label}草稿`, description:"原笔记尚未改变。选择一种方式后才会保存。", body:`<div class="note-diff"><section><strong>原文</strong><pre>${esc(note.content_md)}</pre></section><section><strong>AI 草稿</strong><pre>${esc(content)}</pre></section></div>`, actions:[{label:"取消",value:null},{label:"追加到原文",value:"append"},{label:"保存为新笔记",value:"new"},{label:"替换原文",value:"replace",className:"primary"}]});
+  async function showDraftDiff(note, draftId, content, label, route = {}) {
+    const routeLabel = route.source === "free_model" ? `免费模型 · ${route.actual_model || route.model || "OpenRouter"}` : route.source === "fallback_model" ? `备用模型 · ${route.actual_model || route.model || "已配置模型"}` : "";
+    const description = `原笔记尚未改变。选择一种方式后才会保存。${routeLabel ? `（${routeLabel}）` : ""}`;
+    const result = await openDialog({title:`AI ${label}草稿`, description, body:`<div class="note-diff"><section><strong>原文</strong><pre>${esc(note.content_md)}</pre></section><section><strong>AI 草稿</strong><pre>${esc(content)}</pre></section></div>`, actions:[{label:"取消",value:null},{label:"追加到原文",value:"append"},{label:"保存为新笔记",value:"new"},{label:"替换原文",value:"replace",className:"primary"}]});
     if (!result) { await api(`/api/note-ai-drafts/${draftId}`, {method:"DELETE"}).catch(() => {}); return; }
     try {
       const data = await api(`/api/note-ai-drafts/${draftId}/apply`, {method:"POST", body:JSON.stringify({confirm:true, version:note.version, mode:result})});
